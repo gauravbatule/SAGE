@@ -52,3 +52,7 @@ htmlcov/
 
 # Temp scripts
 _gen_docx.py
+
+# Research paper & docs (local only)
+Maybe Attention Is Not All You Need.*
+Sage_Architecture_Blueprint.md
