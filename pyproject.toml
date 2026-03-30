@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sage-architecture"
+version = "4.0.0"
+description = "Hybrid Graph-Cortex Language Model — Wave Propagation + Resonance Memory"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Gaurav Batule"},
+]
+keywords = [
+    "deep-learning",
+    "language-model",
+    "wave-propagation",
+    "resonance-memory",
+    "attention-free",
+    "graph-neural-network",
+    "pytorch",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "tiktoken>=0.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Repository = "https://github.com/gauravbatule/sage-architecture"
+Issues = "https://github.com/gauravbatule/sage-architecture/issues"
+
+[project.scripts]
+sage-train = "sage.train:main"
+sage-serve = "serve:main"
+
+[tool.setuptools.packages.find]
+include = ["sage*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

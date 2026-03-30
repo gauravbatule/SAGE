@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Sage 4.0</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-base: #171717;
+            --bg-elevated: #212121;
+            --bg-input: #2f2f2f;
+            --text-primary: #ececf1;
+            --text-secondary: #a1a1aa;
+            --border-light: rgba(255, 255, 255, 0.1);
+            --border-focus: rgba(255, 255, 255, 0.3);
+            --accent: #e5e5ea;
+            --radius-ui: 16px;
+            --max-width: 800px;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-base);
+            color: var(--text-primary);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* --- HEADER --- */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 24px;
+            border-bottom: 1px solid var(--border-light);
+            background: var(--bg-base);
+            z-index: 10;
+        }
+
+        .header-title {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .logo {
+            font-weight: 600;
+            font-size: 16px;
+            letter-spacing: -0.02em;
+        }
+
+        .model-badge {
+            background: var(--bg-elevated);
+            color: var(--text-secondary);
+            font-size: 11px;
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-weight: 500;
+            border: 1px solid var(--border-light);
+        }
+
+        .nav-actions {
+            display: flex;
+            gap: 12px;
+        }
+
+        .icon-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 8px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+        }
+
+        .icon-btn:hover {
+            color: var(--text-primary);
+            background: var(--bg-elevated);
+        }
+
+        .icon-btn svg {
+            width: 20px;
+            height: 20px;
+        }
+
+        /* --- SETTINGS DROPDOWN --- */
+        .settings-panel {
+            position: absolute;
+            top: 64px;
+            right: 24px;
+            width: 280px;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-light);
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            z-index: 100;
+            display: none;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .settings-panel.active {
+            display: flex;
+            animation: fadeInDown 0.2s ease;
+        }
+
+        @keyframes fadeInDown {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .setting-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .setting-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+
+        .setting-val {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-primary);
+        }
+
+        input[type="range"] {
+            -webkit-appearance: none;
+            width: 100%;
+            height: 4px;
+            background: var(--bg-input);
+            border-radius: 2px;
+            outline: none;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: var(--accent);
+            cursor: pointer;
+            border: 2px solid var(--bg-elevated);
+        }
+
+        .model-stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-top: 8px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border-light);
+        }
+
+        .stat-item {
+            font-size: 11px;
+            color: var(--text-secondary);
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .stat-item span {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-primary);
+            font-size: 13px;
+        }
+
+        /* --- CHAT AREA --- */
+        .chat-container {
+            flex: 1;
+            overflow-y: auto;
+            scroll-behavior: smooth;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .chat-container::-webkit-scrollbar {
+            width: 6px;
+        }
+        .chat-container::-webkit-scrollbar-thumb {
+            background: var(--bg-input);
+            border-radius: 3px;
+        }
+
+        .welcome-screen {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            max-width: var(--max-width);
+            padding: 40px 24px;
+        }
+
+        .welcome-logo {
+            width: 64px;
+            height: 64px;
+            border-radius: 16px;
+            background: var(--bg-elevated);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            font-weight: 500;
+            margin-bottom: 24px;
+            border: 1px solid var(--border-light);
+        }
+
+        .suggestions {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            width: 100%;
+            max-width: 600px;
+        }
+
+        .suggestion-card {
+            background: transparent;
+            border: 1px solid var(--border-light);
+            border-radius: 12px;
+            padding: 16px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            text-align: left;
+        }
+
+        .suggestion-card:hover {
+            background: var(--bg-elevated);
+            border-color: var(--border-focus);
+        }
+
+        .suggestion-card strong {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 4px;
+            color: var(--text-primary);
+        }
+
+        .suggestion-card span {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        @media (max-width: 640px) {
+            .suggestions { grid-template-columns: 1fr; }
+        }
+
+        /* --- MESSAGES --- */
+        .message-row {
+            width: 100%;
+            border-bottom: 1px solid transparent;
+            padding: 24px;
+            display: flex;
+            justify-content: center;
+        }
+
+        .message-row.sage {
+            background: transparent;
+        }
+
+        .message-wrapper {
+            width: 100%;
+            max-width: var(--max-width);
+            display: flex;
+            gap: 20px;
+        }
+
+        .avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        .avatar.user {
+            background: var(--bg-input);
+            color: var(--text-primary);
+        }
+
+        .avatar.sage {
+            background: var(--text-primary);
+            color: var(--bg-base);
+        }
+
+        .message-content {
+            flex: 1;
+            font-size: 15px;
+            line-height: 1.7;
+            color: var(--text-primary);
+            white-space: pre-wrap;
+            word-break: break-word;
+            padding-top: 4px;
+        }
+
+        .message-meta {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            display: inline-flex;
+            gap: 12px;
+            background: var(--bg-elevated);
+            padding: 6px 10px;
+            border-radius: 6px;
+            border: 1px solid var(--border-light);
+        }
+
+        /* --- TYPING INDICATOR --- */
+        .typing-row {
+            display: none;
+            padding: 24px;
+            width: 100%;
+            justify-content: center;
+        }
+
+        .typing-row.active {
+            display: flex;
+        }
+
+        .dot-container {
+            display: flex;
+            gap: 4px;
+            align-items: center;
+            height: 24px;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--text-secondary);
+            animation: pulse 1.5s infinite ease-in-out;
+        }
+
+        .dot:nth-child(2) { animation-delay: 0.2s; }
+        .dot:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 0.3; transform: scale(0.8); }
+            50% { opacity: 1; transform: scale(1); }
+        }
+
+        /* --- INPUT AREA --- */
+        .input-area {
+            padding: 24px;
+            display: flex;
+            justify-content: center;
+            position: relative;
+        }
+
+        .input-area::before {
+            content: '';
+            position: absolute;
+            top: -30px;
+            left: 0;
+            right: 0;
+            height: 30px;
+            background: linear-gradient(to top, var(--bg-base), transparent);
+            pointer-events: none;
+        }
+
+        .input-wrapper {
+            width: 100%;
+            max-width: var(--max-width);
+            position: relative;
+        }
+
+        .input-box {
+            display: flex;
+            align-items: flex-end;
+            background: var(--bg-input);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-ui);
+            padding: 8px 8px 8px 16px;
+            transition: border-color 0.2s ease, background 0.2s ease;
+        }
+
+        .input-box:focus-within {
+            border-color: var(--border-focus);
+            background: var(--bg-elevated);
+        }
+
+        #chatInput {
+            flex: 1;
+            background: transparent;
+            border: none;
+            outline: none;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 15px;
+            line-height: 1.5;
+            padding: 8px 0;
+            resize: none;
+            max-height: 200px;
+            min-height: 24px;
+        }
+
+        #chatInput::placeholder {
+            color: var(--text-secondary);
+        }
+
+        .send-btn {
+            width: 32px;
+            height: 32px;
+            border-radius: 10px;
+            background: var(--text-primary);
+            color: var(--bg-base);
+            border: none;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            flex-shrink: 0;
+            margin-left: 12px;
+            margin-bottom: 4px;
+        }
+
+        .send-btn:hover:not(:disabled) {
+            opacity: 0.9;
+            transform: scale(1.02);
+        }
+
+        .send-btn:disabled {
+            background: var(--bg-elevated);
+            color: var(--text-secondary);
+            cursor: not-allowed;
+        }
+
+        .send-btn svg {
+            width: 16px;
+            height: 16px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Header -->
+    <header class="header">
+        <div class="header-title">
+            <div class="logo">Sage</div>
+            <div class="model-badge">4.0 Wave + Resonance</div>
+        </div>
+        <div class="nav-actions">
+            <button class="icon-btn" onclick="toggleSettings()" title="Settings">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="3"></circle>
+                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                </svg>
+            </button>
+        </div>
+
+        <!-- Settings Dropdown -->
+        <div class="settings-panel" id="settingsPanel">
+            <div class="setting-group">
+                <div class="setting-header">
+                    <span>Temperature</span>
+                    <span class="setting-val" id="tempVal">0.75</span>
+                </div>
+                <input type="range" id="tempSlider" min="0.1" max="1.5" step="0.05" value="0.75" oninput="updateTemp()">
+            </div>
+            
+            <div class="setting-group">
+                <div class="setting-header">
+                    <span>Max Tokens</span>
+                    <span class="setting-val" id="tokenVal">200</span>
+                </div>
+                <input type="range" id="tokenSlider" min="50" max="500" step="10" value="200" oninput="updateTokens()">
+            </div>
+
+            <div class="model-stats-grid">
+                <div class="stat-item">
+                    <span><span id="statParams">--</span></span>
+                    Params (<span id="statDevice">--</span>)
+                </div>
+                <div class="stat-item">
+                    <span><span id="statThink">--</span></span>
+                    Max Think Layers
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Chat Area -->
+    <div class="chat-container" id="chatContainer">
+        <!-- Welcome Screen -->
+        <div class="welcome-screen" id="welcome">
+            <div class="welcome-logo">S</div>
+            <div class="suggestions">
+                <div class="suggestion-card" onclick="sendSuggestion('What is machine learning?')">
+                    <strong>Explain ML</strong>
+                    <span>Ask about a technical concept</span>
+                </div>
+                <div class="suggestion-card" onclick="sendSuggestion('Write a short poem about the ocean.')">
+                    <strong>Creative Writing</strong>
+                    <span>Generate a short poem</span>
+                </div>
+                <div class="suggestion-card" onclick="sendSuggestion('Give me three tips for staying healthy.')">
+                    <strong>Health Tips</strong>
+                    <span>Get practical advice</span>
+                </div>
+                <div class="suggestion-card" onclick="sendSuggestion('Explain gravity to a child.')">
+                    <strong>Simple Explanation</strong>
+                    <span>Break down a complex topic</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Global Typing Indicator -->
+        <div class="typing-row" id="typingIndicator">
+            <div class="message-wrapper">
+                <div class="avatar sage">S</div>
+                <div class="message-content">
+                    <div class="dot-container">
+                        <div class="dot"></div>
+                        <div class="dot"></div>
+                        <div class="dot"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Input Area -->
+    <div class="input-area">
+        <div class="input-wrapper">
+            <div class="input-box">
+                <textarea id="chatInput" rows="1" placeholder="Message Sage..." onkeydown="handleKey(event)" oninput="autoResize()"></textarea>
+                <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="12" y1="19" x2="12" y2="5"></line>
+                        <polyline points="5 12 12 5 19 12"></polyline>
+                    </svg>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const chatContainer = document.getElementById('chatContainer');
+        const chatInput = document.getElementById('chatInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const typingIndicator = document.getElementById('typingIndicator');
+        const welcome = document.getElementById('welcome');
+        let isGenerating = false;
+
+        // Auto-resize textarea
+        function autoResize() {
+            chatInput.style.height = 'auto';
+            chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + 'px';
+            sendBtn.disabled = chatInput.value.trim().length === 0;
+        }
+
+        // Settings Toggle
+        function toggleSettings() {
+            const panel = document.getElementById('settingsPanel');
+            panel.classList.toggle('active');
+        }
+
+        // Close settings when clicking outside
+        document.addEventListener('click', (e) => {
+            const panel = document.getElementById('settingsPanel');
+            const btn = document.querySelector('.icon-btn');
+            if (panel && btn && panel.classList.contains('active') && !panel.contains(e.target) && !btn.contains(e.target)) {
+                panel.classList.remove('active');
+            }
+        });
+
+        // Load model info
+        async function loadInfo() {
+            try {
+                const res = await fetch('/api/info');
+                if (res.ok) {
+                    const info = await res.json();
+                    document.getElementById('statParams').textContent = (info.total_params / 1e6).toFixed(1) + 'M';
+                    document.getElementById('statDevice').textContent = info.device.toUpperCase();
+                    document.getElementById('statThink').textContent = info.max_think + 'x';
+                }
+            } catch(e) {
+                console.error('Could not load model info:', e);
+            }
+        }
+        loadInfo();
+
+        function updateTemp() {
+            document.getElementById('tempVal').textContent = document.getElementById('tempSlider').value;
+        }
+
+        function updateTokens() {
+            document.getElementById('tokenVal').textContent = document.getElementById('tokenSlider').value;
+        }
+
+        function handleKey(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        }
+
+        function sendSuggestion(text) {
+            chatInput.value = text;
+            autoResize();
+            sendMessage();
+        }
+
+        function escapeHTML(str) {
+            return str.replace(/[&<>'"]/g, 
+                tag => ({
+                    '&': '&amp;',
+                    '<': '&lt;',
+                    '>': '&gt;',
+                    "'": '&#39;',
+                    '"': '&quot;'
+                }[tag] || tag)
+            );
+        }
+
+        function addMessage(text, type, meta = null) {
+            if (welcome) welcome.style.display = 'none';
+
+            const msgRow = document.createElement('div');
+            msgRow.className = `message-row ${type}`;
+
+            // Handle newlines safely
+            const safeText = escapeHTML(text).replace(/\n/g, '<br>');
+
+            let html = `
+                <div class="message-wrapper">
+                    <div class="avatar ${type}">${type === 'user' ? 'U' : 'S'}</div>
+                    <div class="message-content">
+                        <div>${safeText}</div>
+            `;
+
+            if (meta) {
+                html += `
+                    <div class="message-meta">
+                        <span>${meta.tokens_generated} tokens</span>
+                        <span>${(meta.time_ms / 1000).toFixed(2)}s</span>
+                        <span>${meta.tokens_per_sec} t/s</span>
+                        <span>${meta.think_iterations}x think</span>
+                    </div>
+                `;
+            }
+
+            html += `
+                    </div>
+                </div>
+            `;
+
+            msgRow.innerHTML = html;
+            
+            const typingRow = document.getElementById('typingIndicator');
+            if (typingRow && chatContainer.contains(typingRow)) {
+                chatContainer.insertBefore(msgRow, typingRow);
+            } else {
+                chatContainer.appendChild(msgRow);
+            }
+            
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const text = chatInput.value.trim();
+            if (!text || isGenerating) return;
+
+            try {
+                isGenerating = true;
+                sendBtn.disabled = true;
+                chatInput.value = '';
+                chatInput.style.height = 'auto';
+
+                // Close settings if open
+                const panel = document.getElementById('settingsPanel');
+                if (panel) panel.classList.remove('active');
+
+                addMessage(text, 'user');
+
+                if (typingIndicator) typingIndicator.classList.add('active');
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+
+                const tokenEl = document.getElementById('tokenSlider');
+                const tempEl = document.getElementById('tempSlider');
+
+                const res = await fetch('/api/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        prompt: text,
+                        max_tokens: tokenEl ? parseInt(tokenEl.value) : 200,
+                        temperature: tempEl ? parseFloat(tempEl.value) : 0.75,
+                    }),
+                });
+
+                if (typingIndicator) typingIndicator.classList.remove('active');
+
+                if (res.ok) {
+                    const data = await res.json();
+                    addMessage(data.text || '', 'sage', {
+                        tokens_generated: data.tokens_generated || 0,
+                        time_ms: data.time_ms || 0,
+                        tokens_per_sec: data.tokens_per_sec || 0,
+                        think_iterations: data.think_iterations || 0
+                    });
+                } else {
+                    addMessage('Server responded with an error status: ' + res.status, 'sage');
+                }
+
+            } catch(e) {
+                console.error("Chat error:", e);
+                if (typingIndicator) typingIndicator.classList.remove('active');
+                addMessage('Error: Could not connect to Sage server. ' + e.message, 'sage');
+            } finally {
+                isGenerating = false;
+                sendBtn.disabled = chatInput.value.trim().length === 0;
+                chatInput.focus();
+            }
+        }
+    </script>
+</body>
+</html>
