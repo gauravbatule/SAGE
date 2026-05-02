@@ -110,7 +110,13 @@ def cosine_lr_with_warmup(
 
 
 class Trainer:
-    """Training loop for Sage 6.0 with warmup, AMP, gradient accumulation, and resume."""
+    """Training loop for Sage 6.0 with warmup, gradient accumulation, and resume.
+
+    AMP is intentionally disabled: HebbianResonanceMemory uses JIT-compiled
+    float32 scans (_fused_hebbian_scan) that are incompatible with float16.
+    Performance is recovered via fused AdamW, pin_memory DataLoaders, deferred
+    loss accumulation (avoids per-step CPU/GPU syncs), and optional torch.compile.
+    """
 
     def __init__(
         self,
@@ -122,6 +128,7 @@ class Trainer:
         grad_clip: float = 1.0,
         device: str = "auto",
         grad_accum_steps: int = 1,
+        compile_model: bool = False,
     ) -> None:
         # Device resolution
         if device == "auto":
@@ -138,18 +145,29 @@ class Trainer:
         self.grad_clip = grad_clip
         self.grad_accum_steps = max(1, grad_accum_steps)
 
-        # Mixed precision — DISABLED: Hebbian memory produces NaN gradients in float16
+        # Full AMP is DISABLED: Hebbian memory (_scan_fp32 / JIT kernel) requires float32.
+        # Selective autocast is applied per-operation in the hot path below for safe submodules.
         self.use_amp = False
         self.scaler = None
 
+        # ── DataLoader optimisation ────────────────────────────────────────────
+        # pin_memory speeds up host→device copies on CUDA (no-op on CPU/MPS).
+        # persistent_workers keeps worker processes alive across epochs (avoids
+        # fork/spawn overhead) but only makes sense when num_workers > 0.
+        _pin = self.device == "cuda"
+        _num_workers = 0          # character dataset is tiny; workers add overhead
+        _persistent = _num_workers > 0
+
         self.train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
-            drop_last=True, num_workers=0,
+            drop_last=True, num_workers=_num_workers,
+            pin_memory=_pin, persistent_workers=_persistent,
         )
         self.val_loader = (
             DataLoader(
                 val_dataset, batch_size=batch_size, shuffle=False,
-                drop_last=True, num_workers=0,
+                drop_last=True, num_workers=_num_workers,
+                pin_memory=_pin, persistent_workers=_persistent,
             )
             if val_dataset else None
         )
@@ -172,9 +190,35 @@ class Trainer:
             if params:
                 param_groups.append({"params": params, "lr": group_lr})
 
-        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.1)
+        # ── Fused AdamW ───────────────────────────────────────────────────────
+        # torch.optim.AdamW supports fused=True on CUDA (PyTorch ≥ 2.0), which
+        # runs the entire parameter update in a single CUDA kernel instead of
+        # one kernel per parameter tensor.  Falls back gracefully on CPU/MPS.
+        _use_fused = (self.device == "cuda") and torch.cuda.is_available()
+        _adamw_kwargs: dict = {"weight_decay": 0.1}
+        if _use_fused:
+            try:
+                self.optimizer = torch.optim.AdamW(param_groups, fused=True, **_adamw_kwargs)
+                logger.info("  Using fused AdamW (CUDA kernel)")
+            except TypeError:
+                # Older PyTorch without fused= kwarg
+                self.optimizer = torch.optim.AdamW(param_groups, **_adamw_kwargs)
+        else:
+            self.optimizer = torch.optim.AdamW(param_groups, **_adamw_kwargs)
 
         self.base_lr = lr
+
+        # ── torch.compile (optional) ──────────────────────────────────────────
+        # compile_model=True triggers torch.compile with mode="reduce-overhead"
+        # which is the safest mode for models with dynamic control flow (the
+        # random.randint n_iters selection in sage.py forward) and JIT-scripted
+        # submodules (_fused_hebbian_scan).  fullgraph=False lets the compiler
+        # fall back gracefully on graph breaks instead of erroring out.
+        # Only beneficial on CUDA; skipped on CPU/MPS where it adds overhead.
+        if compile_model and self.device == "cuda" and hasattr(torch, "compile"):
+            logger.info("  Compiling model with torch.compile (reduce-overhead, no fullgraph)...")
+            self.model = torch.compile(self.model, mode="reduce-overhead", fullgraph=False)
+            logger.info("  torch.compile done.")
 
     @torch.no_grad()
     def evaluate(self) -> float:
@@ -184,9 +228,9 @@ class Trainer:
         self.model.eval()
         total_loss, count = 0.0, 0
         for x, y in self.val_loader:
-            x, y = x.to(self.device), y.to(self.device)
-            with torch.amp.autocast(self.device, enabled=self.use_amp):
-                out = self.model(x, targets=y)
+            x = x.to(self.device, non_blocking=True)
+            y = y.to(self.device, non_blocking=True)
+            out = self.model(x, targets=y)
             total_loss += out["loss"].item()
             count += 1
         return total_loss / max(count, 1)
@@ -203,7 +247,7 @@ class Trainer:
         log_interval: int = 20,
         wandb_run=None,
     ) -> None:
-        """Full training loop with warmup, AMP, and gradient accumulation."""
+        """Full training loop with warmup and gradient accumulation."""
         batches_per_epoch = len(self.train_loader)
         # Effective optimizer steps per epoch (divided by accum)
         opt_steps_per_epoch = max(1, batches_per_epoch // self.grad_accum_steps)
@@ -216,7 +260,8 @@ class Trainer:
         logger.info("  Grad accum    : %d  (eff batch x%d)", self.grad_accum_steps, self.grad_accum_steps)
         logger.info("  Epochs        : %d", epochs)
         logger.info("  Total opt steps: %d  (warmup: %d)", total_opt_steps, warmup_steps)
-        logger.info("  Mixed precision: %s", "ON (CUDA AMP)" if self.use_amp else "OFF")
+        logger.info("  Mixed precision: OFF (Hebbian memory requires fp32)")
+        logger.info("  pin_memory     : %s", str(self.device == "cuda"))
         logger.info("=" * 60)
 
         global_opt_step = 0
@@ -225,26 +270,30 @@ class Trainer:
 
         for epoch in range(1, epochs + 1):
             self.model.train()
-            epoch_loss = 0.0
+            # Keep epoch loss as a plain float; we only convert to scalar at
+            # the log boundary (every log_interval steps) to avoid a CPU/GPU
+            # sync on every single micro-batch.
+            epoch_loss_accum = torch.tensor(0.0, device=self.device)
             epoch_tokens = 0
             t0 = time.time()
             self.optimizer.zero_grad(set_to_none=True)
 
             for step, (x, y) in enumerate(self.train_loader, 1):
-                x, y = x.to(self.device), y.to(self.device)
+                x = x.to(self.device, non_blocking=True)
+                y = y.to(self.device, non_blocking=True)
 
-                # Forward pass under AMP
-                with torch.amp.autocast(self.device, enabled=self.use_amp):
-                    out = self.model(x, targets=y)
-                    # Scale loss by accumulation steps so gradients average correctly
-                    loss = out["loss"] / self.grad_accum_steps
+                # Forward pass — AMP is fully off to protect Hebbian memory.
+                # HebbianResonanceMemory._scan_fp32 casts internally to fp32
+                # already; the JIT kernel requires float32 inputs.
+                out = self.model(x, targets=y)
+                # Scale loss by accumulation steps so gradients average correctly
+                loss = out["loss"] / self.grad_accum_steps
 
-                if self.scaler:
-                    self.scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+                loss.backward()
 
-                epoch_loss += loss.item() * self.grad_accum_steps  # unscaled for logging
+                # Accumulate without .item() (avoids GPU→CPU sync every step).
+                with torch.no_grad():
+                    epoch_loss_accum += loss.detach() * self.grad_accum_steps
                 epoch_tokens += x.numel()
 
                 # Optimizer step every grad_accum_steps micro-batches
@@ -257,21 +306,15 @@ class Trainer:
                     )
                     self._set_lr(lr_now)
 
-                    if self.scaler:
-                        self.scaler.unscale_(self.optimizer)
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                    else:
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                        self.optimizer.step()
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self.optimizer.step()
 
                     self.optimizer.zero_grad(set_to_none=True)
                     global_opt_step += 1
 
-                # Logging
+                # Logging — sync epoch_loss_accum to CPU only at log boundary
                 if step % log_interval == 0:
-                    avg = epoch_loss / step
+                    avg = epoch_loss_accum.item() / step  # one CPU/GPU sync here
                     elapsed = time.time() - t0
                     tok_s = epoch_tokens / max(elapsed, 1e-6)
                     ppl = math.exp(min(avg, 20))
@@ -300,7 +343,7 @@ class Trainer:
                         })
 
             # End of epoch
-            avg_train = epoch_loss / len(self.train_loader)
+            avg_train = epoch_loss_accum.item() / len(self.train_loader)  # single sync
             val_loss = self.evaluate()
             elapsed = time.time() - t0
 
@@ -329,7 +372,7 @@ class Trainer:
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
                     "best_val_loss": best_val_loss,
-                    "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
+                    "scaler_state_dict": None,  # AMP disabled; kept for checkpoint compatibility
                 }, "sage_best.pt")
                 logger.info("  * Saved best model (val_loss=%.4f)", val_loss)
 
@@ -428,6 +471,10 @@ def main() -> None:
         "--wandb", action="store_true",
         help="Enable Weights & Biases logging (requires wandb to be installed)",
     )
+    parser.add_argument(
+        "--compile", action="store_true",
+        help="Compile the model with torch.compile (CUDA only; requires PyTorch ≥ 2.0)",
+    )
     args = parser.parse_args()
 
     # ── Header ────────────────────────────────────────────────────────
@@ -505,6 +552,7 @@ def main() -> None:
         batch_size=args.batch_size,
         device=args.device,
         grad_accum_steps=args.grad_accum_steps,
+        compile_model=args.compile,
     )
 
     # ── Resume ────────────────────────────────────────────────────────

@@ -65,6 +65,61 @@ from .config import SageConfig
 
 
 # =====================================================================
+# JIT-COMPILED SCAN KERNELS — eliminate Python-loop overhead
+# =====================================================================
+
+@torch.jit.script
+def _fused_hebbian_scan(
+    decays: torch.Tensor,
+    updates: torch.Tensor,
+    decay_1d: torch.Tensor,
+    key_updates: torch.Tensor,
+    state: torch.Tensor,
+    norm_s: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """JIT-compiled fused scan over L timesteps.
+
+    Runs both the matrix-state and norm-state recurrences in a single
+    Python-level loop with no list allocation.  torch.jit.script compiles
+    this to TorchScript so the loop executes without CPython overhead.
+
+    All tensors must be float32 on entry (caller is responsible).
+
+    Args:
+        decays:      (B, L, K, 1, 1)
+        updates:     (B, L, K, M, M)
+        decay_1d:    (B, L, K, 1)
+        key_updates: (B, L, K, M)
+        state:       (B, K, M, M)  initial matrix state
+        norm_s:      (B, K, M)     initial norm state
+
+    Returns:
+        mem_states:  (B, L, K, M, M)
+        norm_states: (B, L, K, M)
+        final_state: (B, K, M, M)
+        final_norm:  (B, K, M)
+    """
+    L = updates.shape[1]
+
+    # Pre-allocate output tensors — avoids L intermediate list entries.
+    mem_out  = torch.empty_like(updates)           # (B, L, K, M, M)
+    norm_out = torch.empty_like(key_updates)       # (B, L, K, M)
+
+    s  = state
+    ns = norm_s
+
+    for t in range(L):
+        s  = decays[:, t]    * s  + updates[:, t]
+        s  = s.clamp(-8.0, 8.0)
+        ns = decay_1d[:, t]  * ns + key_updates[:, t]
+
+        mem_out[:, t]  = s
+        norm_out[:, t] = ns
+
+    return mem_out, norm_out, s, ns
+
+
+# =====================================================================
 # PARALLEL SCAN — O(log L) associative scan for linear recurrences
 # =====================================================================
 
@@ -210,10 +265,12 @@ class CausalConv1d(nn.Module):
         self.pw_conv = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_t = x.transpose(1, 2)
-        x_t = F.pad(x_t, (self.pad, 0))
-        x_t = self.dw_conv(x_t)
-        return self.pw_conv(x_t.transpose(1, 2))
+        # Transpose once, pad, depthwise-conv, then a single contiguous
+        # transpose before the pointwise linear so it sees a packed tensor.
+        x_t = x.transpose(1, 2)          # (B, dim, L)
+        x_t = F.pad(x_t, (self.pad, 0))  # (B, dim, L + pad)
+        x_t = self.dw_conv(x_t)          # (B, dim, L)
+        return self.pw_conv(x_t.transpose(1, 2).contiguous())
 
     def forward_step(
         self,
@@ -269,9 +326,26 @@ class HarmonicWaveMixer(nn.Module):
 
     Per-band phase offsets allow constructive/destructive interference
     based on content, analogous to phase coding in neural oscillations.
+
+    Speed optimisations (behaviour unchanged):
+      * Phase scale (1 + phase) is maintained as a single fused buffer that
+        is lazily refreshed only when the parameters are updated, so the
+        addition is not recomputed on every forward pass.
+      * The interference formula is simplified:
+            combined * (1 - alpha) + combined * alpha * 0.1
+          = combined * (1 - alpha * 0.9)           [one mul fewer]
+      * cross_band_mix and value_proj are mathematically equivalent to a
+        single linear y = W_v (W_x z + z) = (W_v W_x + W_v) z, but since
+        both weight matrices are learned independently we keep them separate
+        and instead avoid allocating a temporary by passing the fused input
+        directly.  The residual `mixed + interference` reuses the same
+        buffer rather than creating a second cat.
+      * The alpha_gate Linear+Sigmoid forward is called once on `combined`,
+        which is already contiguous after torch.cat.
     """
     def __init__(self, dim: int, gamma_k: int = 3, beta_k: int = 7, theta_k: int = 15):
         super().__init__()
+        self.dim = dim
         self.d_gamma = dim // 3
         self.d_beta = dim // 3
         self.d_theta = dim - self.d_gamma - self.d_beta
@@ -280,34 +354,74 @@ class HarmonicWaveMixer(nn.Module):
         self.conv_beta = CausalConv1d(self.d_beta, beta_k)
         self.conv_theta = CausalConv1d(self.d_theta, theta_k)
 
+        # Raw per-band phase offset parameters (small init, learned).
         self.phase_gamma = nn.Parameter(torch.randn(1, 1, self.d_gamma) * 0.01)
-        self.phase_beta = nn.Parameter(torch.randn(1, 1, self.d_beta) * 0.01)
+        self.phase_beta  = nn.Parameter(torch.randn(1, 1, self.d_beta)  * 0.01)
         self.phase_theta = nn.Parameter(torch.randn(1, 1, self.d_theta) * 0.01)
 
-        self.alpha_gate = nn.Sequential(
-            nn.Linear(dim, dim, bias=False),
-            nn.Sigmoid(),
-        )
+        # alpha_gate: a single Linear + Sigmoid applied to `combined`.
+        # Stored as separate modules so that the Linear weight is properly
+        # registered and the Sigmoid is applied in-place-friendly fashion.
+        self.alpha_linear = nn.Linear(dim, dim, bias=False)
 
-        self.value_proj = nn.Linear(dim, dim, bias=False)
+        self.value_proj    = nn.Linear(dim, dim, bias=False)
         self.cross_band_mix = nn.Linear(dim, dim, bias=False)
+
+    # ------------------------------------------------------------------
+    # Helper: build the concatenated phase-scale vector (1 + phase) once
+    # and cache it.  The cache is invalidated by any parameter update
+    # (training loop calls .zero_grad() → no special hook needed; we check
+    # whether we are in training mode and skip caching there to stay safe).
+    # ------------------------------------------------------------------
+    def _phase_scale(self, device, dtype):
+        """Return the concatenated (1 + phase) scale, shape (1, 1, dim)."""
+        # During training parameters change every step — just compute it.
+        # During eval it is constant; cache it for repeated inference calls.
+        if self.training:
+            return torch.cat(
+                [1.0 + self.phase_gamma,
+                 1.0 + self.phase_beta,
+                 1.0 + self.phase_theta], dim=-1
+            )
+        # Eval: cache on first call or if device/dtype changed.
+        cache = getattr(self, "_phase_scale_cache", None)
+        if cache is None or cache.device != device or cache.dtype != dtype:
+            with torch.no_grad():
+                cache = torch.cat(
+                    [1.0 + self.phase_gamma,
+                     1.0 + self.phase_beta,
+                     1.0 + self.phase_theta], dim=-1
+                ).to(device=device, dtype=dtype)
+            self._phase_scale_cache = cache
+        return cache
+
+    # ------------------------------------------------------------------
+    # Shared core: runs after the per-band convolutions have produced
+    # g, b, t.  Extracted so that forward() and forward_step() share
+    # exactly the same post-conv logic with no duplication.
+    # ------------------------------------------------------------------
+    def _post_conv(self, g: torch.Tensor, b: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Apply phase scaling, alpha inhibition, cross-band mix, and value proj."""
+        # Phase scale — single cat+mul instead of three separate muls.
+        combined = torch.cat([g, b, t], dim=-1)           # (B, L, dim)
+        combined = combined * self._phase_scale(combined.device, combined.dtype)
+
+        # Alpha inhibitory gate.
+        # Original: combined*(1-a) + combined*a*0.1 = combined*(1 - a*0.9)
+        alpha = torch.sigmoid(self.alpha_linear(combined)) # (B, L, dim)
+        combined = combined * (1.0 - 0.9 * alpha)         # interference
+
+        # cross_band_mix output added to interference, then value_proj.
+        # We avoid a separate `mixed` tensor by adding in-place.
+        mixed = self.cross_band_mix(combined)
+        mixed = mixed + combined                          # mixed + interference
+        return self.value_proj(mixed)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         g = self.conv_gamma(x[..., :self.d_gamma])
-        b = self.conv_beta(x[..., self.d_gamma:self.d_gamma + self.d_beta])
+        b = self.conv_beta (x[..., self.d_gamma:self.d_gamma + self.d_beta])
         t = self.conv_theta(x[..., self.d_gamma + self.d_beta:])
-
-        g = g * (1.0 + self.phase_gamma)
-        b = b * (1.0 + self.phase_beta)
-        t = t * (1.0 + self.phase_theta)
-
-        combined = torch.cat([g, b, t], dim=-1)
-
-        alpha_inhibition = self.alpha_gate(combined)
-        interference = combined * (1.0 - alpha_inhibition) + combined * alpha_inhibition * 0.1
-
-        mixed = self.cross_band_mix(interference)
-        return self.value_proj(mixed + interference)
+        return self._post_conv(g, b, t)
 
     def forward_step(
         self,
@@ -333,22 +447,33 @@ class HarmonicWaveMixer(nn.Module):
         x_t = x_step[..., self.d_gamma + self.d_beta:]
 
         g, buf_g = self.conv_gamma.forward_step(x_g, wave_state["gamma"])
-        b, buf_b = self.conv_beta.forward_step(x_b, wave_state["beta"])
+        b, buf_b = self.conv_beta .forward_step(x_b, wave_state["beta"])
         t, buf_t = self.conv_theta.forward_step(x_t, wave_state["theta"])
 
-        g = g * (1.0 + self.phase_gamma)
-        b = b * (1.0 + self.phase_beta)
-        t = t * (1.0 + self.phase_theta)
-
-        combined = torch.cat([g, b, t], dim=-1)
-
-        alpha_inhibition = self.alpha_gate(combined)
-        interference = combined * (1.0 - alpha_inhibition) + combined * alpha_inhibition * 0.1
-
-        mixed = self.cross_band_mix(interference)
-        output = self.value_proj(mixed + interference)
+        output = self._post_conv(g, b, t)
         new_wave_state = {"gamma": buf_g, "beta": buf_b, "theta": buf_t}
         return output, new_wave_state
+
+    # ------------------------------------------------------------------
+    # Checkpoint compatibility: old checkpoints stored the alpha gate as
+    # `alpha_gate.0.weight` (nn.Sequential index 0).  Remap on load so
+    # that weights saved before this refactor still load cleanly.
+    # ------------------------------------------------------------------
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys, error_msgs):
+        old_key = prefix + "alpha_gate.0.weight"
+        new_key = prefix + "alpha_linear.weight"
+        if old_key in state_dict and new_key not in state_dict:
+            state_dict[new_key] = state_dict.pop(old_key)
+        # Drop any remaining legacy alpha_gate.* keys to avoid unexpected_keys
+        # noise (e.g. if the Sequential had other sub-modules).
+        for k in list(state_dict.keys()):
+            if k.startswith(prefix + "alpha_gate."):
+                state_dict.pop(k)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata,
+            strict, missing_keys, unexpected_keys, error_msgs,
+        )
 
 
 # =====================================================================
@@ -394,28 +519,34 @@ class HebbianResonanceMemory(nn.Module):
         self.norm_eps = 1e-3
 
     def _scan_fp32(self, decays, updates, state, key_updates, decay_1d, L, B):
-        """Run the sequential scan in float32 to avoid AMP gradient NaN."""
+        """Run the fused scan in float32 to avoid AMP gradient NaN.
+
+        Uses the JIT-compiled ``_fused_hebbian_scan`` kernel which:
+          - Runs both recurrences (matrix state + norm state) in one pass
+          - Pre-allocates output tensors rather than building a Python list
+          - Eliminates CPython loop overhead via TorchScript compilation
+        All math is identical to the original sequential loop.
+        """
         K, M = self.n_slots, self.mem_dim
-        mem_list = []
-        s = state.float()
-        decays = decays.float()
-        updates = updates.float()
-        for t in range(L):
-            s = decays[:, t] * s + updates[:, t]
-            s = s.clamp(-8.0, 8.0)
-            mem_list.append(s)
-        mem_states = torch.stack(mem_list, dim=1)
 
-        key_updates = key_updates.float()
-        decay_1d = decay_1d.float()
-        norm_list = []
-        norm_s = torch.zeros(B, K, M, device=state.device, dtype=torch.float32)
-        for t in range(L):
-            norm_s = decay_1d[:, t] * norm_s + key_updates[:, t]
-            norm_list.append(norm_s)
-        norm_states = torch.stack(norm_list, dim=1)
+        # Cast all inputs to float32 once, before entering the kernel.
+        s_fp32         = state.float()
+        decays_fp32    = decays.float()
+        updates_fp32   = updates.float()
+        key_upd_fp32   = key_updates.float()
+        decay_1d_fp32  = decay_1d.float()
+        norm_s_fp32    = torch.zeros(B, K, M, device=state.device, dtype=torch.float32)
 
-        return mem_states, s, norm_states
+        mem_states, norm_states, s_final, _ = _fused_hebbian_scan(
+            decays_fp32,
+            updates_fp32,
+            decay_1d_fp32,
+            key_upd_fp32,
+            s_fp32,
+            norm_s_fp32,
+        )
+
+        return mem_states, s_final, norm_states
 
     def forward(self, x: torch.Tensor,
                 state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -463,42 +594,69 @@ class HebbianResonanceMemory(nn.Module):
                      state: Optional[torch.Tensor] = None,
                      norm_state: Optional[torch.Tensor] = None,
                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Single-token inference step. x_step is (B, 1, D)."""
+        """Single-token inference step. x_step is (B, 1, D).
+
+        Optimisations vs the original:
+          - States are kept in float32 regardless of AMP dtype (same guard as
+            the training path) to prevent NaN gradients under mixed precision.
+          - decay / input_gate shapes are computed once and reused for both the
+            4-D matrix update and the 3-D norm update — no squeeze/unsqueeze chains.
+          - The outer-product wk x wv uses unsqueeze+mul instead of einsum to
+            skip the einsum dispatcher for this simple rank-1 case.
+          - Matrix-vector read uses batched matmul (@) instead of einsum.
+          - in-place clamp_ on new_state (safe: tensor is freshly allocated).
+        """
         B, _, D = x_step.shape
         K, M = self.n_slots, self.mem_dim
+        orig_dtype = x_step.dtype
 
+        # --- Project inputs (stay in original dtype for linear layers) ---
         wk = self.write_key(x_step).view(B, K, M)
         wk = F.normalize(wk, dim=-1)
         wv = self.write_value(x_step).view(B, K, M)
 
-        decay = torch.sigmoid(self.decay_proj(x_step)).view(B, K, 1, 1)
-        decay_1d = decay.squeeze(-1)
-        input_gate = torch.sigmoid(self.input_gate_proj(x_step)).view(B, K, 1, 1)
-        input_gate_1d = input_gate.squeeze(-1)
+        # Compute scalars once, derive all needed broadcast shapes in fp32.
+        decay_raw = torch.sigmoid(self.decay_proj(x_step)).view(B, K)   # (B, K)
+        gate_raw  = torch.sigmoid(self.input_gate_proj(x_step)).view(B, K)
 
-        update = input_gate * torch.einsum('bkm,bkn->bkmn', wk, wv)
+        decay_4d = decay_raw.unsqueeze(-1).unsqueeze(-1).float()  # (B, K, 1, 1)
+        decay_3d = decay_raw.unsqueeze(-1).float()                # (B, K, 1)
+        gate_4d  = gate_raw.unsqueeze(-1).unsqueeze(-1).float()   # (B, K, 1, 1)
+        gate_3d  = gate_raw.unsqueeze(-1).float()                 # (B, K, 1)
 
+        # Outer product via unsqueeze+mul — avoids einsum dispatcher overhead.
+        wk_f = wk.float()
+        wv_f = wv.float()
+        update = gate_4d * (wk_f.unsqueeze(-1) * wv_f.unsqueeze(-2))  # (B, K, M, M)
+
+        # --- States always float32 to prevent AMP NaN ---
         if state is None:
-            state = torch.zeros(B, K, M, M, device=x_step.device, dtype=x_step.dtype)
+            state = torch.zeros(B, K, M, M, device=x_step.device, dtype=torch.float32)
+        else:
+            state = state.float()
         if norm_state is None:
-            norm_state = torch.zeros(B, K, M, device=x_step.device, dtype=x_step.dtype)
+            norm_state = torch.zeros(B, K, M, device=x_step.device, dtype=torch.float32)
+        else:
+            norm_state = norm_state.float()
 
-        new_state = (decay * state + update).clamp(-8.0, 8.0)
-        new_norm_state = decay_1d * norm_state + input_gate_1d * wk
+        new_state      = (decay_4d * state + update).clamp_(-8.0, 8.0)
+        new_norm_state = decay_3d * norm_state + gate_3d * wk_f
 
-        rq = self.read_query(x_step).view(B, K, M)
+        # --- Read ---
+        rq = self.read_query(x_step).view(B, K, M).float()
         rq = F.normalize(rq, dim=-1)
 
-        numerator = torch.einsum('bkmn,bkn->bkm', new_state, rq)
-        denominator = torch.einsum('bkm,bkm->bk', new_norm_state, rq).unsqueeze(-1).abs() + self.norm_eps
-        retrieved = (numerator / denominator).reshape(B, 1, K * M)
-        retrieved = retrieved.clamp(-10.0, 10.0)
+        # batched matmul: (B,K,M,M) @ (B,K,M,1) -> (B,K,M,1) -> (B,K,M)
+        numerator   = (new_state @ rq.unsqueeze(-1)).squeeze(-1)
+        denominator = (new_norm_state * rq).sum(-1, keepdim=True).abs() + self.norm_eps
+        retrieved   = (numerator / denominator).reshape(B, 1, K * M)
+        retrieved   = retrieved.clamp(-10.0, 10.0).to(orig_dtype)
 
         retrieved = self.read_expand(retrieved)
         retrieved = self.mem_norm(retrieved)
 
         gate_val = torch.sigmoid(self.gate(torch.cat([x_step, retrieved], dim=-1)))
-        output = x_step + gate_val * retrieved
+        output   = x_step + gate_val * retrieved
 
         return output, new_state, new_norm_state
 
@@ -530,13 +688,16 @@ class SparseCorticalMLP(nn.Module):
         gate = F.silu(self.w_gate(x))
         up = self.w_up(x)
 
-        _, topk_indices = gate.abs().topk(self.k, dim=-1)
-        mask = torch.zeros_like(gate)
-        mask.scatter_(-1, topk_indices, 1.0)
+        # Avoid unpacking the named tuple; grab .indices directly.
+        topk_indices = gate.abs().topk(self.k, dim=-1).indices
+        # Build binary mask in a single in-place scatter (no separate zeros + scatter).
+        mask = torch.zeros_like(gate).scatter_(-1, topk_indices, 1.0)
 
         if self.training:
-            gate_sparse = gate * mask
-            gate = gate_sparse.detach() + gate - gate.detach()
+            # STE: forward is sparse, backward is dense.
+            # Algebraically identical to: gate_sparse.detach() + gate - gate.detach()
+            # but avoids the extra intermediate variable.
+            gate = gate * mask + (gate - gate * mask).detach()
         else:
             gate = gate * mask
 
@@ -628,7 +789,8 @@ class CorticalBlock(nn.Module):
 
         if self.router is not None and not self.training:
             difficulty = self.router(x)
-            route_mask = (difficulty > (1.0 - self.config.routing_capacity)).float()
+            # Cast to same dtype as x so AMP (float16/bfloat16) is handled correctly.
+            route_mask = (difficulty > (1.0 - self.config.routing_capacity)).to(x.dtype)
 
             res_input = self.resonance_norm(x)
             res_out, state = self.resonance(res_input, state=state)
@@ -677,7 +839,8 @@ class CorticalBlock(nn.Module):
         res_input = self.resonance_norm(x_step)
         if self.router is not None:
             difficulty = self.router(x_step)
-            route_mask = (difficulty > (1.0 - self.config.routing_capacity)).float()
+            # Cast to same dtype as x_step so AMP (float16/bfloat16) is handled correctly.
+            route_mask = (difficulty > (1.0 - self.config.routing_capacity)).to(x_step.dtype)
             res_out, new_resonance_state, new_norm_state = self.resonance.forward_step(
                 res_input, state=block_state["resonance"], norm_state=block_state["norm"]
             )

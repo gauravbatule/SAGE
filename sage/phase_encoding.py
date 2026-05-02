@@ -38,15 +38,20 @@ class PhaseEncoding(nn.Module):
         inv_freq = 1.0 / (10000.0 ** (torch.arange(0, config.core_dim, 2).float() / config.core_dim))
         self.register_buffer("inv_freq", inv_freq)
 
+        # Pre-compute the phase output dimension (2 * len(inv_freq)) so we
+        # don't re-evaluate the comparison inside every forward() call.
+        self._phase_len = inv_freq.shape[0] * 2  # equals D for even dim, D-1 for odd
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, D = x.shape
         positions = torch.arange(L, device=x.device, dtype=x.dtype)
         freqs = torch.outer(positions, self.inv_freq)
-        phase = torch.cat([freqs.sin(), freqs.cos()], dim=-1)
-        if phase.shape[-1] > D:
+        phase = torch.cat([freqs.sin(), freqs.cos()], dim=-1)  # (L, phase_len)
+        # Handle odd core_dim: phase may be one element short or (rarely) over.
+        if self._phase_len > D:
             phase = phase[:, :D]
-        elif phase.shape[-1] < D:
-            phase = torch.cat([phase, phase[:, :D - phase.shape[-1]]], dim=-1)
+        elif self._phase_len < D:
+            phase = torch.cat([phase, phase[:, :D - self._phase_len]], dim=-1)
         return x * (1.0 + self.alpha * phase.unsqueeze(0))
 
     def forward_step(self, x_step: torch.Tensor, step_idx: int) -> torch.Tensor:
@@ -69,11 +74,11 @@ class PhaseEncoding(nn.Module):
         D = x_step.shape[-1]
         pos = torch.tensor(step_idx, device=x_step.device, dtype=x_step.dtype)
         freqs = pos * self.inv_freq                          # (D//2,)
-        phase = torch.cat([freqs.sin(), freqs.cos()], dim=-1)  # (D,)
-        if phase.shape[-1] > D:
+        phase = torch.cat([freqs.sin(), freqs.cos()], dim=-1)  # (phase_len,)
+        if self._phase_len > D:
             phase = phase[:D]
-        elif phase.shape[-1] < D:
-            phase = torch.cat([phase, phase[:D - phase.shape[-1]]], dim=-1)
+        elif self._phase_len < D:
+            phase = torch.cat([phase, phase[:D - self._phase_len]], dim=-1)
         # Reshape to (1, 1, D) for broadcast over (B, 1, D).
         phase = phase.unsqueeze(0).unsqueeze(0)
         return x_step * (1.0 + self.alpha * phase)

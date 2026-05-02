@@ -23,10 +23,30 @@ from sage.generation import top_p_sample
 
 warnings.filterwarnings("ignore")
 
+# Detect mmap support for torch.load (PyTorch >= 2.1)
+_TORCH_LOAD_SUPPORTS_MMAP = "mmap" in torch.load.__code__.co_varnames
+
+
+def _warmup_model(model, device: str, n_steps: int = 3) -> None:
+    """Run a few dummy forward_step calls to pre-compile CUDA kernels."""
+    try:
+        dummy = torch.zeros(1, 1, dtype=torch.long, device=device)
+        with torch.inference_mode():
+            _, state = model.forward_step(dummy, step_idx=0, recurrent_state=None)
+            for i in range(1, n_steps):
+                _, state = model.forward_step(dummy, step_idx=i, recurrent_state=state)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        pass  # warmup is best-effort
+
 
 def detect_and_load(path: str, device: str = "cpu"):
     """Load checkpoint and auto-detect tokenizer type."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    load_kwargs = {"map_location": device, "weights_only": False}
+    if _TORCH_LOAD_SUPPORTS_MMAP:
+        load_kwargs["mmap"] = True
+    ckpt = torch.load(path, **load_kwargs)
 
     if not isinstance(ckpt, dict):
         print("Error: unrecognized checkpoint format.")
@@ -98,6 +118,22 @@ def detect_and_load(path: str, device: str = "cpu"):
     model.to(device)
     model.eval()
 
+    # fp16 on GPU: inference doesn't need gradients so fp16 is safe and ~2x faster
+    if device != "cpu" and torch.cuda.is_available():
+        model.half()
+
+    # torch.compile for graph-optimised kernels (PyTorch >= 2.0)
+    try:
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+        print("  [torch.compile] Model compiled for optimised inference.")
+    except Exception:
+        pass  # compile is best-effort; fall back silently
+
+    # GPU warmup: run a tiny dummy batch through forward_step so CUDA kernels
+    # are pre-compiled and the first real generation step isn't slow.
+    if device != "cpu" and torch.cuda.is_available():
+        _warmup_model(model, device)
+
     # Build tokenizer
     if is_bpe and ckpt.get("tokenizer_name"):
         import tiktoken
@@ -132,9 +168,12 @@ def stream_response(model, config, tokenizer, tok_type, prompt, device,
     n_generated = 0
     t_start = time.perf_counter()
 
-    with torch.no_grad():
+    # torch.inference_mode() is strictly stronger than no_grad():
+    # it disables the autograd engine entirely (no version tracking),
+    # reducing per-op overhead and enabling additional kernel fusions.
+    with torch.inference_mode():
         # --- Phase 1: Prefill ---
-        model.eval()
+        # model.eval() is called once at load time; skip per-call overhead.
         model.metacog.reset()
         prefill_out = model(input_ids)
         first_logits = prefill_out["logits"][:, -1, :]
@@ -152,6 +191,11 @@ def stream_response(model, config, tokenizer, tok_type, prompt, device,
         step_idx = L
         generated = []
 
+        # BPE: accumulate bytes so multi-byte UTF-8 codepoints never get split
+        # across tokens and printed as mojibake.  We flush only when the token
+        # boundary lands on a valid UTF-8 sequence.
+        bpe_byte_buffer: list[int] = []
+
         while len(generated) < max_tokens:
             token_id = next_token.item()
 
@@ -162,12 +206,21 @@ def stream_response(model, config, tokenizer, tok_type, prompt, device,
             generated.append(token_id)
             n_generated += 1
 
-            # Decode and print immediately
+            # Decode and print
             if tok_type == "char":
-                char = tokenizer.decode([token_id])
+                # Character tokenizer: always single char, flush immediately.
+                print(tokenizer.decode([token_id]), end="", flush=True)
             else:
-                char = tokenizer.decode([token_id])
-            print(char, end="", flush=True)
+                # BPE: batch the raw bytes then flush valid UTF-8 only.
+                raw = tokenizer.decode_bytes([token_id])
+                bpe_byte_buffer.extend(raw)
+                try:
+                    text = bytes(bpe_byte_buffer).decode("utf-8")
+                    print(text, end="", flush=True)
+                    bpe_byte_buffer.clear()
+                except UnicodeDecodeError:
+                    # Incomplete multi-byte sequence — wait for next token.
+                    pass
 
             # BPE stop-string check (after printing)
             if tok_type == "bpe" and n_generated > 3:
@@ -185,6 +238,14 @@ def stream_response(model, config, tokenizer, tok_type, prompt, device,
 
             next_token = top_p_sample(logits[:, -1, :], temperature, top_p)
             step_idx += 1
+
+        # Flush any leftover bytes (e.g. a lone continuation byte at EOS)
+        if bpe_byte_buffer:
+            try:
+                print(bytes(bpe_byte_buffer).decode("utf-8", errors="replace"),
+                      end="", flush=True)
+            except Exception:
+                pass
 
     elapsed = time.perf_counter() - t_start
     return n_generated, elapsed

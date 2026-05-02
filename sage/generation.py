@@ -30,18 +30,24 @@ def top_p_sample(
     """
     logits = logits / max(temperature, 1e-6)
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
-    # Remove tokens with cumulative probability above threshold
-    removal_mask = (cumulative_probs - F.softmax(sorted_logits, dim=-1)) >= top_p
+    # Compute probabilities once and derive cumulative sum from them —
+    # avoids calling softmax twice (was called separately for cumsum and probs).
+    probs = F.softmax(sorted_logits, dim=-1)
+    cumulative_probs = torch.cumsum(probs, dim=-1)
+
+    # Mask tokens whose cumulative probability (exclusive) exceeds top_p.
+    # Shift cumsum by one to make the check exclusive (keep at least one token).
+    removal_mask = (cumulative_probs - probs) >= top_p
     sorted_logits[removal_mask] = float("-inf")
 
+    # Re-normalise after masking.
     probs = F.softmax(sorted_logits, dim=-1)
     sampled_idx = torch.multinomial(probs, 1)
     return sorted_indices.gather(-1, sampled_idx)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def generate_tokens(
     model: "SageModel",  # noqa: F821 — forward reference to avoid circular import
     input_ids: torch.Tensor,

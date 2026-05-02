@@ -78,7 +78,7 @@ class SageModel(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         B, L = token_ids.shape
 
-        active_ids, energies, positions = self.senses.ground_text(token_ids)
+        active_ids, _energies, _positions = self.senses.ground_text(token_ids)
 
         x = self.graph(active_ids)
 
@@ -88,7 +88,7 @@ class SageModel(nn.Module):
         prev_x = torch.zeros_like(x)
         total_iterations = 0
         all_confidences = []
-        refinement_loss = torch.tensor(0.0, device=x.device)
+        refinement_loss = x.new_zeros(())
         prev_logits = None
 
         if self.training:
@@ -149,7 +149,7 @@ class SageModel(nn.Module):
             }
         }
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(
         self,
         prompt_ids: torch.Tensor,
@@ -167,7 +167,7 @@ class SageModel(nn.Module):
             stop_token_id=eos_token_id,
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def forward_step(
         self,
         token_id: torch.Tensor,
@@ -224,10 +224,14 @@ class SageModel(nn.Module):
         if self.config.weight_tying and logits.shape[-1] > self.config.text_vocab_size:
             logits = logits[:, :, :self.config.text_vocab_size]
 
-        new_recurrent_state = {"core_state": new_core_state}
-        return logits, new_recurrent_state
+        # Reuse the incoming dict object when possible to avoid a fresh allocation
+        # on every decode step (acts as a lightweight "KV-cache" state carrier).
+        if recurrent_state is not None:
+            recurrent_state["core_state"] = new_core_state
+            return logits, recurrent_state
+        return logits, {"core_state": new_core_state}
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate_fast(
         self,
         prompt_ids: torch.Tensor,

@@ -79,8 +79,10 @@ class MetacognitiveController(nn.Module):
         prev_summary = previous_output.mean(dim=1)
 
         iter_idx = min(iteration, self.config.max_think_iterations - 1)
+        # Use torch.as_tensor to avoid boxing a Python int into a new tensor object
+        # on every call — this reuses a scalar tensor when possible.
         iter_emb = self.iteration_embed(
-            torch.tensor(iter_idx, device=current_output.device)
+            torch.as_tensor(iter_idx, device=current_output.device)
         )
         iter_context = self.iter_proj(iter_emb)
         curr_summary_ctx = curr_summary + iter_context.unsqueeze(0).expand_as(curr_summary)
