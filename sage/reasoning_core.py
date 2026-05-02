@@ -391,7 +391,7 @@ class HebbianResonanceMemory(nn.Module):
 
         self.gate = nn.Linear(dim * 2, dim, bias=False)
         self.mem_norm = RMSNorm(dim)
-        self.norm_eps = 1e-6
+        self.norm_eps = 1e-3
 
     def forward(self, x: torch.Tensor,
                 state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -411,18 +411,24 @@ class HebbianResonanceMemory(nn.Module):
             state = torch.zeros(B, K, M, M, device=x.device, dtype=x.dtype)
 
         decays = decay.unsqueeze(-1).unsqueeze(-1)
-        mem_states = parallel_scan(decays, updates, initial_state=state)
-        state = mem_states[:, -1]
 
-        # Denominator normalizer (running key sum) for bounded retrieval
+        mem_list = []
+        s = state
+        for t in range(L):
+            s = decays[:, t] * s + updates[:, t]
+            s = s.clamp(-8.0, 8.0)
+            mem_list.append(s)
+        mem_states = torch.stack(mem_list, dim=1)
+        state = s
+
         key_updates = input_gate.unsqueeze(-1) * wk
         decay_1d = decay.unsqueeze(-1)
-        norm_states = []
+        norm_list = []
         norm_s = torch.zeros(B, K, M, device=x.device, dtype=x.dtype)
         for t in range(L):
             norm_s = decay_1d[:, t] * norm_s + key_updates[:, t]
-            norm_states.append(norm_s)
-        norm_states = torch.stack(norm_states, dim=1)
+            norm_list.append(norm_s)
+        norm_states = torch.stack(norm_list, dim=1)
 
         rq = self.read_query(x).view(B, L, K, M)
         rq = F.normalize(rq, dim=-1)
@@ -430,6 +436,7 @@ class HebbianResonanceMemory(nn.Module):
         numerator = torch.einsum('blkmn,blkn->blkm', mem_states, rq)
         denominator = torch.einsum('blkm,blkm->blk', norm_states, rq).unsqueeze(-1).abs() + self.norm_eps
         retrieved = (numerator / denominator).reshape(B, L, K * M)
+        retrieved = retrieved.clamp(-10.0, 10.0)
 
         retrieved = self.read_expand(retrieved)
         retrieved = self.mem_norm(retrieved)
@@ -463,7 +470,7 @@ class HebbianResonanceMemory(nn.Module):
         if norm_state is None:
             norm_state = torch.zeros(B, K, M, device=x_step.device, dtype=x_step.dtype)
 
-        new_state = decay * state + update
+        new_state = (decay * state + update).clamp(-8.0, 8.0)
         new_norm_state = decay_1d * norm_state + input_gate_1d * wk
 
         rq = self.read_query(x_step).view(B, K, M)
@@ -472,6 +479,7 @@ class HebbianResonanceMemory(nn.Module):
         numerator = torch.einsum('bkmn,bkn->bkm', new_state, rq)
         denominator = torch.einsum('bkm,bkm->bk', new_norm_state, rq).unsqueeze(-1).abs() + self.norm_eps
         retrieved = (numerator / denominator).reshape(B, 1, K * M)
+        retrieved = retrieved.clamp(-10.0, 10.0)
 
         retrieved = self.read_expand(retrieved)
         retrieved = self.mem_norm(retrieved)
