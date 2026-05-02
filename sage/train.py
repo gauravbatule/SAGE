@@ -481,7 +481,7 @@ def main() -> None:
         resonance_decay_init=0.95,
         sparse_k_ratio=0.3,
         dropout=0.1,
-        layer_scale_init=1e-4,
+        layer_scale_init=1.0,
         max_think_iterations=2,
         min_think_iterations=1,
         max_train_iterations=2,
