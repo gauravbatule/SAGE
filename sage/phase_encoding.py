@@ -48,3 +48,32 @@ class PhaseEncoding(nn.Module):
         elif phase.shape[-1] < D:
             phase = torch.cat([phase, phase[:, :D - phase.shape[-1]]], dim=-1)
         return x * (1.0 + self.alpha * phase.unsqueeze(0))
+
+    def forward_step(self, x_step: torch.Tensor, step_idx: int) -> torch.Tensor:
+        """Apply phase encoding to a single token at absolute position step_idx.
+
+        Args:
+            x_step:   (B, 1, D) — features for a single token.
+            step_idx: int — the absolute sequence position of this token.
+                      Matches the position that would be used if the full
+                      sequence ``[0 .. step_idx]`` were passed to forward().
+
+        Returns:
+            (B, 1, D) — amplitude-modulated features.
+
+        The computation is identical to forward() at row step_idx: we compute
+        ``phase = [sin(step_idx * inv_freq); cos(step_idx * inv_freq)]`` and
+        apply ``x * (1 + alpha * phase)``. This keeps step-mode and full-sequence
+        mode numerically identical — no approximation is introduced.
+        """
+        D = x_step.shape[-1]
+        pos = torch.tensor(step_idx, device=x_step.device, dtype=x_step.dtype)
+        freqs = pos * self.inv_freq                          # (D//2,)
+        phase = torch.cat([freqs.sin(), freqs.cos()], dim=-1)  # (D,)
+        if phase.shape[-1] > D:
+            phase = phase[:D]
+        elif phase.shape[-1] < D:
+            phase = torch.cat([phase, phase[:D - phase.shape[-1]]], dim=-1)
+        # Reshape to (1, 1, D) for broadcast over (B, 1, D).
+        phase = phase.unsqueeze(0).unsqueeze(0)
+        return x_step * (1.0 + self.alpha * phase)

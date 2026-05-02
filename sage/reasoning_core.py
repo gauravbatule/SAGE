@@ -50,6 +50,7 @@ __all__ = [
     "SparseCorticalMLP",
     "CorticalBlock",
     "ReasoningCore",
+    "parallel_scan",
 ]
 
 import math
@@ -61,6 +62,126 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from .config import SageConfig
+
+
+# =====================================================================
+# PARALLEL SCAN — O(log L) associative scan for linear recurrences
+# =====================================================================
+
+def parallel_scan(
+    decays: torch.Tensor,
+    updates: torch.Tensor,
+    initial_state: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Parallel prefix scan solving the first-order linear recurrence:
+
+        state_t = decay_t * state_{t-1} + update_t
+
+    Each position is represented as an associative pair (a, b) meaning
+    "state = a * prev_state + b".  The combine rule is:
+
+        (a1, b1) ⊕ (a2, b2)  =  (a2 * a1,  a2 * b1 + b2)
+
+    which corresponds to composing two affine steps left-to-right.
+    Because the operation is associative, a Blelloch up-sweep evaluates
+    all prefix products in O(log L) parallel steps, not O(L) sequential
+    ones.  All work within each depth level is fully data-parallel and
+    launches a single fused kernel per level — no Python loop over L.
+
+    Args:
+        decays:        (B, L, K, 1, 1)  — per-step, per-slot scalar decay
+                       factors, broadcast-ready over the (M, M) matrix dims.
+        updates:       (B, L, K, M, M)  — per-step Hebbian outer-product
+                       updates (already multiplied by the input gate).
+        initial_state: (B, K, M, M) or None.  When provided, seeds the
+                       recurrence so that state_{-1} = initial_state,
+                       enabling chunked / autoregressive continuation.
+                       When None, the hidden state starts at zero.
+
+    Returns:
+        all_states: (B, L, K, M, M)  — memory matrix at every time step,
+                    i.e. all_states[:, t] == state_t for t in [0, L).
+
+    Algorithm
+    ---------
+    Represent the sequence as two tensors of shape (B, L_pad, K, M, M):
+      ``a`` — the multiplicative coefficient (decay), tiled to (M, M)
+      ``b`` — the additive term (update / accumulated output so far)
+
+    Identity element: (a=1, b=0).  We pad to the next power of 2 with
+    identity pairs so the sweep length is always a power of two.
+
+    Up-sweep (inclusive prefix scan):
+        For stride s = 1, 2, 4, ..., L_pad/2:
+            For every index i >= s  (processed simultaneously):
+                new_b[i] = a[i] * b[i-s] + b[i]
+                new_a[i] = a[i] * a[i-s]
+
+    After ceil(log2 L) passes, b[t] == state_t.
+    """
+    B, L, K, M, _ = updates.shape
+
+    # ------------------------------------------------------------------
+    # 1. Absorb the initial state into position 0's additive term.
+    #    state_0 = decay_0 * s0 + update_0  =>  b_0 = decay_0 * s0 + update_0
+    #    so the scan can treat the implicit prev-state as zero everywhere.
+    # ------------------------------------------------------------------
+    if initial_state is not None:
+        # initial_state: (B, K, M, M) -> (B, 1, K, M, M)
+        s0 = initial_state.unsqueeze(1)
+        updates = updates.clone()
+        updates[:, :1] = decays[:, :1] * s0 + updates[:, :1]
+
+    # ------------------------------------------------------------------
+    # 2. Pad sequence length to the next power of two with identity pairs.
+    #    Identity: (a=1, b=0) is a no-op under the combine rule.
+    # ------------------------------------------------------------------
+    L_orig = L
+    L_pad = 1 << (max(L, 1) - 1).bit_length() if L > 1 else 1
+    pad = L_pad - L
+
+    if pad > 0:
+        a_pad = decays.new_ones(B, pad, K, 1, 1)
+        b_pad = updates.new_zeros(B, pad, K, M, M)
+        a = torch.cat([decays, a_pad], dim=1)    # (B, L_pad, K, 1, 1)
+        b = torch.cat([updates, b_pad], dim=1)   # (B, L_pad, K, M, M)
+    else:
+        a = decays.clone()    # (B, L_pad, K, 1, 1)
+        b = updates.clone()   # (B, L_pad, K, M, M)
+
+    # ------------------------------------------------------------------
+    # 3. Blelloch up-sweep — O(log L_pad) kernel launches total.
+    #    Each level processes all eligible (right, left) pairs in parallel
+    #    via advanced indexing; there is no Python loop over positions.
+    # ------------------------------------------------------------------
+    stride = 1
+    while stride < L_pad:
+        # right ∈ {stride, stride+1, ..., L_pad-1}  (all at once)
+        right = torch.arange(stride, L_pad, device=a.device)
+        left  = right - stride
+
+        a_left  = a[:, left]    # (B, n_pairs, K, 1, 1)
+        b_left  = b[:, left]    # (B, n_pairs, K, M, M)
+        a_right = a[:, right]   # (B, n_pairs, K, 1, 1)
+        b_right = b[:, right]   # (B, n_pairs, K, M, M)
+
+        # Combine: (a_left, b_left) ⊕ (a_right, b_right)
+        #       => (a_right * a_left,  a_right * b_left + b_right)
+        new_a_right = a_right * a_left
+        new_b_right = a_right * b_left + b_right
+
+        # Clone before scatter to avoid aliasing across stride levels.
+        a = a.clone()
+        b = b.clone()
+        a[:, right] = new_a_right
+        b[:, right] = new_b_right
+
+        stride <<= 1
+
+    # ------------------------------------------------------------------
+    # 4. Slice back to original length; b[:, t] == state_t.
+    # ------------------------------------------------------------------
+    return b[:, :L_orig]   # (B, L, K, M, M)
 
 
 class RMSNorm(nn.Module):
@@ -83,6 +204,7 @@ class CausalConv1d(nn.Module):
     """Causal 1D depthwise-separable convolution — position i sees only j <= i."""
     def __init__(self, dim: int, kernel_size: int):
         super().__init__()
+        self.kernel_size = kernel_size
         self.pad = kernel_size - 1
         self.dw_conv = nn.Conv1d(dim, dim, kernel_size, padding=0, groups=dim, bias=True)
         self.pw_conv = nn.Linear(dim, dim, bias=False)
@@ -92,6 +214,45 @@ class CausalConv1d(nn.Module):
         x_t = F.pad(x_t, (self.pad, 0))
         x_t = self.dw_conv(x_t)
         return self.pw_conv(x_t.transpose(1, 2))
+
+    def forward_step(
+        self,
+        x_step: torch.Tensor,
+        conv_buffer: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Process a single time step using a rolling buffer for O(1) inference.
+
+        Args:
+            x_step:      (B, 1, dim)  — the new token's features.
+            conv_buffer: (B, dim, kernel_size-1)  — previous context, or None
+                         on the first call (will be zero-initialised).
+
+        Returns:
+            output:     (B, 1, dim)              — convolved + projected output.
+            new_buffer: (B, dim, kernel_size-1)  — updated sliding-window buffer.
+        """
+        # x_step arrives as (B, 1, dim); transpose to (B, dim, 1) for Conv1d.
+        x_t = x_step.transpose(1, 2)  # (B, dim, 1)
+
+        if conv_buffer is None:
+            conv_buffer = torch.zeros(
+                x_t.shape[0], x_t.shape[1], self.kernel_size - 1,
+                dtype=x_t.dtype, device=x_t.device,
+            )
+
+        # Concatenate buffer + new step → (B, dim, kernel_size).
+        windowed = torch.cat([conv_buffer, x_t], dim=2)
+
+        # Depthwise conv over the full window → (B, dim, 1).
+        out = self.dw_conv(windowed)
+
+        # Pointwise linear: transpose to (B, 1, dim), project, return.
+        output = self.pw_conv(out.transpose(1, 2))  # (B, 1, dim)
+
+        # Slide the window: drop the oldest frame, keep the last (kernel_size-1).
+        new_buffer = windowed[:, :, 1:]  # (B, dim, kernel_size-1)
+
+        return output, new_buffer
 
 
 class HarmonicWaveMixer(nn.Module):
@@ -129,6 +290,7 @@ class HarmonicWaveMixer(nn.Module):
         )
 
         self.value_proj = nn.Linear(dim, dim, bias=False)
+        self.cross_band_mix = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         g = self.conv_gamma(x[..., :self.d_gamma])
@@ -144,7 +306,49 @@ class HarmonicWaveMixer(nn.Module):
         alpha_inhibition = self.alpha_gate(combined)
         interference = combined * (1.0 - alpha_inhibition) + combined * alpha_inhibition * 0.1
 
-        return self.value_proj(interference)
+        mixed = self.cross_band_mix(interference)
+        return self.value_proj(mixed + interference)
+
+    def forward_step(
+        self,
+        x_step: torch.Tensor,
+        wave_state: Optional[dict],
+    ) -> Tuple[torch.Tensor, dict]:
+        """Single-token wave propagation using per-band rolling conv buffers.
+
+        Args:
+            x_step:     (B, 1, dim) — the new token's features.
+            wave_state: dict with keys 'gamma', 'beta', 'theta' holding
+                        (B, d_band, kernel_size-1) rolling buffers, or None.
+
+        Returns:
+            output:         (B, 1, dim)
+            new_wave_state: updated dict of rolling buffers.
+        """
+        if wave_state is None:
+            wave_state = {"gamma": None, "beta": None, "theta": None}
+
+        x_g = x_step[..., :self.d_gamma]
+        x_b = x_step[..., self.d_gamma:self.d_gamma + self.d_beta]
+        x_t = x_step[..., self.d_gamma + self.d_beta:]
+
+        g, buf_g = self.conv_gamma.forward_step(x_g, wave_state["gamma"])
+        b, buf_b = self.conv_beta.forward_step(x_b, wave_state["beta"])
+        t, buf_t = self.conv_theta.forward_step(x_t, wave_state["theta"])
+
+        g = g * (1.0 + self.phase_gamma)
+        b = b * (1.0 + self.phase_beta)
+        t = t * (1.0 + self.phase_theta)
+
+        combined = torch.cat([g, b, t], dim=-1)
+
+        alpha_inhibition = self.alpha_gate(combined)
+        interference = combined * (1.0 - alpha_inhibition) + combined * alpha_inhibition * 0.1
+
+        mixed = self.cross_band_mix(interference)
+        output = self.value_proj(mixed + interference)
+        new_wave_state = {"gamma": buf_g, "beta": buf_b, "theta": buf_t}
+        return output, new_wave_state
 
 
 # =====================================================================
@@ -187,6 +391,7 @@ class HebbianResonanceMemory(nn.Module):
 
         self.gate = nn.Linear(dim * 2, dim, bias=False)
         self.mem_norm = RMSNorm(dim)
+        self.norm_eps = 1e-6
 
     def forward(self, x: torch.Tensor,
                 state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -194,6 +399,7 @@ class HebbianResonanceMemory(nn.Module):
         K, M = self.n_slots, self.mem_dim
 
         wk = self.write_key(x).view(B, L, K, M)
+        wk = F.normalize(wk, dim=-1)
         wv = self.write_value(x).view(B, L, K, M)
 
         decay = torch.sigmoid(self.decay_proj(x))
@@ -204,17 +410,26 @@ class HebbianResonanceMemory(nn.Module):
         if state is None:
             state = torch.zeros(B, K, M, M, device=x.device, dtype=x.dtype)
 
-        mem_states = []
-        for t in range(L):
-            d = decay[:, t, :].unsqueeze(-1).unsqueeze(-1)
-            state = d * state + updates[:, t]
-            mem_states.append(state)
+        decays = decay.unsqueeze(-1).unsqueeze(-1)
+        mem_states = parallel_scan(decays, updates, initial_state=state)
+        state = mem_states[:, -1]
 
-        mem_states = torch.stack(mem_states, dim=1)
+        # Denominator normalizer (running key sum) for bounded retrieval
+        key_updates = input_gate.unsqueeze(-1) * wk
+        decay_1d = decay.unsqueeze(-1)
+        norm_states = []
+        norm_s = torch.zeros(B, K, M, device=x.device, dtype=x.dtype)
+        for t in range(L):
+            norm_s = decay_1d[:, t] * norm_s + key_updates[:, t]
+            norm_states.append(norm_s)
+        norm_states = torch.stack(norm_states, dim=1)
 
         rq = self.read_query(x).view(B, L, K, M)
-        retrieved = torch.einsum('blkmn,blkn->blkm', mem_states, rq)
-        retrieved = retrieved.reshape(B, L, K * M)
+        rq = F.normalize(rq, dim=-1)
+
+        numerator = torch.einsum('blkmn,blkn->blkm', mem_states, rq)
+        denominator = torch.einsum('blkm,blkm->blk', norm_states, rq).unsqueeze(-1).abs() + self.norm_eps
+        retrieved = (numerator / denominator).reshape(B, L, K * M)
 
         retrieved = self.read_expand(retrieved)
         retrieved = self.mem_norm(retrieved)
@@ -223,6 +438,48 @@ class HebbianResonanceMemory(nn.Module):
         output = x + gate_val * retrieved
 
         return output, state
+
+    def forward_step(self, x_step: torch.Tensor,
+                     state: Optional[torch.Tensor] = None,
+                     norm_state: Optional[torch.Tensor] = None,
+                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Single-token inference step. x_step is (B, 1, D)."""
+        B, _, D = x_step.shape
+        K, M = self.n_slots, self.mem_dim
+
+        wk = self.write_key(x_step).view(B, K, M)
+        wk = F.normalize(wk, dim=-1)
+        wv = self.write_value(x_step).view(B, K, M)
+
+        decay = torch.sigmoid(self.decay_proj(x_step)).view(B, K, 1, 1)
+        decay_1d = decay.squeeze(-1)
+        input_gate = torch.sigmoid(self.input_gate_proj(x_step)).view(B, K, 1, 1)
+        input_gate_1d = input_gate.squeeze(-1)
+
+        update = input_gate * torch.einsum('bkm,bkn->bkmn', wk, wv)
+
+        if state is None:
+            state = torch.zeros(B, K, M, M, device=x_step.device, dtype=x_step.dtype)
+        if norm_state is None:
+            norm_state = torch.zeros(B, K, M, device=x_step.device, dtype=x_step.dtype)
+
+        new_state = decay * state + update
+        new_norm_state = decay_1d * norm_state + input_gate_1d * wk
+
+        rq = self.read_query(x_step).view(B, K, M)
+        rq = F.normalize(rq, dim=-1)
+
+        numerator = torch.einsum('bkmn,bkn->bkm', new_state, rq)
+        denominator = torch.einsum('bkm,bkm->bk', new_norm_state, rq).unsqueeze(-1).abs() + self.norm_eps
+        retrieved = (numerator / denominator).reshape(B, 1, K * M)
+
+        retrieved = self.read_expand(retrieved)
+        retrieved = self.mem_norm(retrieved)
+
+        gate_val = torch.sigmoid(self.gate(torch.cat([x_step, retrieved], dim=-1)))
+        output = x_step + gate_val * retrieved
+
+        return output, new_state, new_norm_state
 
 
 # =====================================================================
@@ -255,7 +512,12 @@ class SparseCorticalMLP(nn.Module):
         _, topk_indices = gate.abs().topk(self.k, dim=-1)
         mask = torch.zeros_like(gate)
         mask.scatter_(-1, topk_indices, 1.0)
-        gate = gate * mask + gate.detach() * (1.0 - mask) - gate.detach() * (1.0 - mask)
+
+        if self.training:
+            gate_sparse = gate * mask
+            gate = gate_sparse.detach() + gate - gate.detach()
+        else:
+            gate = gate * mask
 
         return self.w_down(gate * up)
 
@@ -286,8 +548,8 @@ class CorticalBlock(nn.Module):
 
         depth_ratio = layer_idx / max(config.core_n_layers - 1, 1)
         gamma_k = 3
-        beta_k = 7 + int(depth_ratio * 8)
-        theta_k = 15 + int(depth_ratio * 48)
+        beta_k = 7 + int(depth_ratio * 16)
+        theta_k = 31 + int(depth_ratio * 96)
         beta_k = beta_k | 1
         theta_k = theta_k | 1
 
@@ -312,11 +574,12 @@ class CorticalBlock(nn.Module):
         self.mlp_scale = nn.Parameter(torch.full((), config.layer_scale_init))
 
         if config.predictive_coding and layer_idx < config.core_n_layers - 1:
-            self.predictor = nn.Linear(dim, dim, bias=False)
-            self.prediction_gate = nn.Sequential(
-                nn.Linear(dim, dim, bias=False),
-                nn.Sigmoid(),
+            self.predictor = nn.Sequential(
+                nn.Linear(dim, dim * 2, bias=False),
+                nn.SiLU(),
+                nn.Linear(dim * 2, dim, bias=False),
             )
+            self.prediction_gate = nn.Parameter(torch.tensor(-2.0))
         else:
             self.predictor = None
             self.prediction_gate = None
@@ -366,6 +629,55 @@ class CorticalBlock(nn.Module):
 
         return x, state, prediction
 
+    def forward_step(
+        self,
+        x_step: torch.Tensor,
+        block_state: Optional[dict],
+    ) -> Tuple[torch.Tensor, dict]:
+        """Process a single token (B, 1, D) through this CorticalBlock with O(1) state.
+
+        block_state is a dict with keys:
+            'wave':       dict of rolling conv buffers for HarmonicWaveMixer
+            'resonance':  (B, K, M, M) Hebbian memory matrix
+
+        Returns (output, new_block_state). Skips gradient checkpointing and
+        predictive-coding error gating (no previous prediction available in
+        step mode); predictive coding is only meaningful across the full sequence.
+        """
+        if block_state is None:
+            block_state = {"wave": None, "resonance": None, "norm": None}
+
+        # --- Wave sub-step (replaces _wave_fn for single token) ---
+        x_norm = self.wave_norm(x_step)
+        wave_out, new_wave_state = self.wave.forward_step(x_norm, block_state["wave"])
+        x_step = x_step + self.drop(wave_out) * self.wave_scale
+
+        # --- Resonance sub-step with optional cognitive routing ---
+        res_input = self.resonance_norm(x_step)
+        if self.router is not None:
+            difficulty = self.router(x_step)
+            route_mask = (difficulty > (1.0 - self.config.routing_capacity)).float()
+            res_out, new_resonance_state, new_norm_state = self.resonance.forward_step(
+                res_input, state=block_state["resonance"], norm_state=block_state["norm"]
+            )
+            res_delta = self.drop(res_out - res_input) * self.resonance_scale
+            x_step = x_step + res_delta * route_mask
+        else:
+            res_out, new_resonance_state, new_norm_state = self.resonance.forward_step(
+                res_input, state=block_state["resonance"], norm_state=block_state["norm"]
+            )
+            x_step = x_step + self.drop(res_out - res_input) * self.resonance_scale
+
+        # --- MLP sub-step (SparseCorticalMLP is stateless per token) ---
+        x_step = x_step + self.drop(self.mlp(self.mlp_norm(x_step))) * self.mlp_scale
+
+        new_block_state = {
+            "wave": new_wave_state,
+            "resonance": new_resonance_state,
+            "norm": new_norm_state,
+        }
+        return x_step, new_block_state
+
 
 class ReasoningCore(nn.Module):
     """
@@ -401,12 +713,43 @@ class ReasoningCore(nn.Module):
 
         for i, layer in enumerate(self.layers):
             if prev_prediction is not None and self.config.predictive_coding:
-                error = x - prev_prediction
-                gate = self.layers[i - 1].prediction_gate(x)
-                x = gate * error + (1.0 - gate) * x
+                error = x - prev_prediction.detach()
+                gate = torch.sigmoid(self.layers[i - 1].prediction_gate)
+                x = x + gate * error
 
             x, state, prediction = layer(x, state=states[i])
             new_states.append(state)
             prev_prediction = prediction
 
         return self.output_norm(x), new_states
+
+    def forward_step(
+        self,
+        x_step: torch.Tensor,
+        core_state: Optional[list],
+    ) -> Tuple[torch.Tensor, list]:
+        """Single-token recurrent inference through all CorticalBlocks.
+
+        Args:
+            x_step:     (B, 1, D) — embedded + phase-encoded token features.
+            core_state: list of per-layer block_state dicts (from a previous
+                        forward_step or seeded from a full forward() pass),
+                        or None to initialise fresh zero state.
+
+        Returns:
+            output:         (B, 1, D) — normalised output features.
+            new_core_state: updated list of per-layer block_state dicts.
+
+        Note: predictive-coding error gating is skipped in step mode because
+        there is no inter-block prediction from a previous sequence position.
+        The Hebbian memory and conv buffers carry all necessary recurrent state.
+        """
+        if core_state is None:
+            core_state = [None] * len(self.layers)
+
+        new_core_state = []
+        for layer, blk_state in zip(self.layers, core_state):
+            x_step, new_blk_state = layer.forward_step(x_step, blk_state)
+            new_core_state.append(new_blk_state)
+
+        return self.output_norm(x_step), new_core_state

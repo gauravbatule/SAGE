@@ -94,7 +94,7 @@ CONFIGS = {
         n_nodes=1_000_000, core_dim=512, core_n_layers=6,
         n_active_limit=2048, text_vocab_size=32000,
         resonance_n_slots=8, resonance_mem_dim=64, resonance_decay_init=0.95,
-        sparse_k_ratio=0.2, routing_capacity=0.5,
+        sparse_k_ratio=0.4, routing_capacity=0.5,
         dropout=0.1, gradient_checkpointing=False, layer_scale_init=1e-4,
     ),
     "beta": lambda: SageConfig(

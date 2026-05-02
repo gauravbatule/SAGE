@@ -154,14 +154,25 @@ class Trainer:
             if val_dataset else None
         )
 
-        # Separate parameter groups: graph learns slower (knowledge stability)
-        self.optimizer = torch.optim.AdamW([
-            {"params": model.graph.parameters(), "lr": lr * 0.3},
-            {"params": model.core.parameters(), "lr": lr},
-            {"params": model.phase.parameters(), "lr": lr},
-            {"params": model.metacog.parameters(), "lr": lr},
-            {"params": model.senses.parameters(), "lr": lr},
-        ], weight_decay=0.1)
+        # Collect parameters, avoiding duplicates from weight tying
+        seen = set()
+        param_groups = []
+        for name, group_lr in [
+            ("graph", lr * 0.3),
+            ("core", lr),
+            ("phase", lr),
+            ("metacog", lr),
+            ("senses", lr),
+        ]:
+            params = []
+            for p in getattr(model, name).parameters():
+                if id(p) not in seen:
+                    seen.add(id(p))
+                    params.append(p)
+            if params:
+                param_groups.append({"params": params, "lr": group_lr})
+
+        self.optimizer = torch.optim.AdamW(param_groups, weight_decay=0.1)
 
         self.base_lr = lr
 

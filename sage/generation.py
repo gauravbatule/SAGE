@@ -51,6 +51,7 @@ def generate_tokens(
     stop_token_id: Optional[int] = None,
     stop_strings: Optional[List[str]] = None,
     decode_fn: Optional[callable] = None,
+    use_recurrent: bool = True,
 ) -> List[int]:
     """
     Autoregressive token generation with top-p sampling.
@@ -64,10 +65,29 @@ def generate_tokens(
         stop_token_id: Stop generation when this token is produced.
         stop_strings: Stop generation if any of these strings appear in the tail.
         decode_fn: Optional decoder function for stop-string detection.
+        use_recurrent: If True (default) and the model exposes ``forward_step``,
+            use recurrent O(1)-per-token inference via ``generate_fast()``.
+            This avoids re-reading the full growing context window on every
+            decode step. Set to False to fall back to the naive re-read loop
+            (useful for debugging or when state seeding is not desired).
 
     Returns:
         List of generated token IDs (excluding the prompt).
     """
+    # --- Fast path: delegate to generate_fast when forward_step is available ---
+    # generate_fast handles stop_token_id natively. When stop_strings are also
+    # needed (rare; requires a decode_fn), we fall through to the loop below so
+    # stop-string matching continues to work correctly.
+    if use_recurrent and hasattr(model, "forward_step") and not stop_strings:
+        return model.generate_fast(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=stop_token_id,
+        )
+
+    # --- Fallback: naive re-read loop (O(L*N) total) ---
     model.eval()
     generated: List[int] = []
     current_ids = input_ids

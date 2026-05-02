@@ -420,6 +420,100 @@ class TestComponents:
         output = m(tokens)
         assert output["logits"].shape[-1] == small_config.text_vocab_size
 
+    def test_causal_conv_step(self, small_config: SageConfig):
+        from sage.reasoning_core import CausalConv1d
+        conv = CausalConv1d(32, kernel_size=5)
+        x = torch.randn(1, 10, 32)
+        full_out = conv(x)
+        buf = None
+        step_outs = []
+        for t in range(10):
+            out, buf = conv.forward_step(x[:, t:t+1, :], buf)
+            step_outs.append(out)
+        step_out = torch.cat(step_outs, dim=1)
+        assert torch.allclose(full_out, step_out, atol=1e-5)
+
+    def test_wave_mixer_step(self, small_config: SageConfig):
+        from sage.reasoning_core import HarmonicWaveMixer
+        wave = HarmonicWaveMixer(small_config.core_dim, gamma_k=3, beta_k=7, theta_k=15)
+        x = torch.randn(1, 8, small_config.core_dim)
+        full_out = wave(x)
+        state = None
+        step_outs = []
+        for t in range(8):
+            out, state = wave.forward_step(x[:, t:t+1, :], state)
+            step_outs.append(out)
+        step_out = torch.cat(step_outs, dim=1)
+        assert torch.allclose(full_out, step_out, atol=1e-4)
+
+    def test_hebbian_step(self, small_config: SageConfig):
+        from sage.reasoning_core import HebbianResonanceMemory
+        mem = HebbianResonanceMemory(
+            dim=small_config.core_dim,
+            n_slots=small_config.resonance_n_slots,
+            mem_dim=small_config.resonance_mem_dim,
+        )
+        x = torch.randn(1, 1, small_config.core_dim)
+        out, state, norm_state = mem.forward_step(x)
+        assert out.shape == x.shape
+        K, M = small_config.resonance_n_slots, small_config.resonance_mem_dim
+        assert state.shape == (1, K, M, M)
+        assert norm_state.shape == (1, K, M)
+
+    def test_cortical_block_step(self, small_config: SageConfig):
+        from sage.reasoning_core import CorticalBlock
+        block = CorticalBlock(small_config, layer_idx=0)
+        x = torch.randn(1, 1, small_config.core_dim)
+        out, state = block.forward_step(x, None)
+        assert out.shape == x.shape
+        assert "wave" in state
+        assert "resonance" in state
+
+    def test_reasoning_core_step(self, small_config: SageConfig):
+        from sage.reasoning_core import ReasoningCore
+        core = ReasoningCore(small_config)
+        x = torch.randn(1, 1, small_config.core_dim)
+        out, states = core.forward_step(x, None)
+        assert out.shape == x.shape
+        assert len(states) == small_config.core_n_layers
+
+    def test_model_forward_step(self, model: SageModel, small_config: SageConfig):
+        token = torch.randint(0, small_config.text_vocab_size, (1, 1))
+        logits, state = model.forward_step(token, step_idx=0)
+        assert logits.shape == (1, 1, small_config.text_vocab_size)
+        assert "core_state" in state
+
+    def test_model_generate_fast(self, model: SageModel, small_config: SageConfig):
+        prompt = torch.randint(0, small_config.text_vocab_size, (1, 4))
+        generated = model.generate_fast(prompt, max_new_tokens=5, temperature=1.0)
+        assert len(generated) <= 5
+
+    def test_parallel_scan(self, small_config: SageConfig):
+        from sage.reasoning_core import parallel_scan
+        B, L, K, M = 1, 8, 2, 4
+        decays = torch.rand(B, L, K, 1, 1) * 0.5 + 0.5
+        updates = torch.randn(B, L, K, M, M) * 0.1
+        result = parallel_scan(decays, updates)
+        assert result.shape == (B, L, K, M, M)
+        state = torch.zeros(B, K, M, M)
+        for t in range(L):
+            state = decays[:, t] * state + updates[:, t]
+            assert torch.allclose(result[:, t], state, atol=1e-5)
+
+    def test_phase_encoding_step(self, small_config: SageConfig):
+        from sage.phase_encoding import PhaseEncoding
+        phase = PhaseEncoding(small_config)
+        x = torch.randn(1, 8, small_config.core_dim)
+        full_out = phase(x)
+        for t in range(8):
+            step_out = phase.forward_step(x[:, t:t+1, :], t)
+            assert torch.allclose(full_out[:, t:t+1, :], step_out, atol=1e-5)
+
+    def test_cross_band_mixing(self, small_config: SageConfig):
+        from sage.reasoning_core import HarmonicWaveMixer
+        wave = HarmonicWaveMixer(small_config.core_dim)
+        assert hasattr(wave, "cross_band_mix")
+
 
 # --- Version Test ---
 
