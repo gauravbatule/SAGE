@@ -1,5 +1,5 @@
 """
-Sage 4.0 — Sensory Cortex
+Sage 5.0 — Sensory Cortex
 
 Multimodal input grounding. Maps raw inputs (text token IDs, vision patches,
 audio frames) into the unified core_dim embedding space for downstream processing
@@ -7,6 +7,8 @@ by the reasoning core.
 """
 
 __all__ = ["SensoryCortex"]
+
+import warnings
 
 import torch
 import torch.nn as nn
@@ -21,14 +23,12 @@ class SensoryCortex(nn.Module):
         super().__init__()
         self.config = config
 
-        # Vision: project patches to core_dim (not node_dim)
         self.vision_proj = nn.Sequential(
             nn.Linear(config.vision_patch_dim, config.core_dim),
             nn.SiLU(),
             nn.Linear(config.core_dim, config.core_dim),
         )
 
-        # Audio: project frames to core_dim
         self.audio_proj = nn.Sequential(
             nn.Linear(config.audio_frame_dim, config.core_dim),
             nn.SiLU(),
@@ -38,11 +38,16 @@ class SensoryCortex(nn.Module):
     def ground_text(
         self, token_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Text tokens map 1:1 to graph nodes. No projection needed.
-        Returns (node_ids, energies, positions).
-        """
         B, L = token_ids.shape
+        oov_mask = (token_ids < 0) | (token_ids >= self.config.text_vocab_size)
+        if oov_mask.any():
+            n_oov = int(oov_mask.sum().item())
+            warnings.warn(
+                f"SensoryCortex.ground_text: {n_oov} token ID(s) out of range "
+                f"[0, {self.config.text_vocab_size}). Clamping to valid range.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         node_ids = token_ids.clamp(0, self.config.text_vocab_size - 1)
         energies = torch.ones(B, L, device=token_ids.device)
         positions = torch.arange(L, device=token_ids.device).unsqueeze(0).expand(B, -1)

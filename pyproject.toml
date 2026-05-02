@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sage-architecture"
-version = "4.0.0"
+version = "5.0.0"
 description = "Hybrid Graph-Cortex Language Model — Wave Propagation + Resonance Memory"
 readme = "README.md"
 license = {text = "MIT"}
@@ -22,13 +22,14 @@ keywords = [
     "pytorch",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
@@ -41,14 +42,18 @@ dev = [
     "pytest>=7.0",
     "ruff>=0.1.0",
 ]
+bench = [
+    "tabulate>=0.9.0",
+]
 
 [project.urls]
-Repository = "https://github.com/gauravbatule/sage-architecture"
-Issues = "https://github.com/gauravbatule/sage-architecture/issues"
+Repository = "https://github.com/gauravbatule/SAGE"
+Issues = "https://github.com/gauravbatule/SAGE/issues"
 
 [project.scripts]
 sage-train = "sage.train:main"
 sage-serve = "serve:main"
+sage-benchmark = "sage.benchmark:main"
 
 [tool.setuptools.packages.find]
 include = ["sage*"]

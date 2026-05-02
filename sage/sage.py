@@ -1,5 +1,5 @@
 """
-Sage 4.0 — Model Orchestrator
+Sage 5.0 — Model Orchestrator
 
 End-to-end model that wires together the Sage architecture:
 
@@ -13,9 +13,10 @@ Position is implicit in causal convolutions — no positional encoding needed.
 **Unique to Sage**:
     - Graph-based knowledge substrate (scalable to billions on NVMe)
     - Multi-scale causal wave propagation (conv-based sequence mixing)
-    - Resonance memory (compressed global context via cumulative write/read)
+    - Resonance memory with exponential decay (compressed global context)
     - Metacognitive iterative reasoning (adaptive depth per token)
     - Weight tying (embedding == output head)
+    - Per-layer scaling and gradient checkpointing
 """
 
 __all__ = ["SageModel"]
@@ -35,7 +36,7 @@ from .metacognitive import MetacognitiveController
 
 class SageModel(nn.Module):
     """
-    Sage 4.0: Wave Propagation Language Model with Metacognitive Control.
+    Sage 5.0: Wave Propagation Language Model with Metacognitive Control.
     """
 
     def __init__(self, config: SageConfig):
@@ -101,7 +102,7 @@ class SageModel(nn.Module):
                 continue
 
             # Inference: metacognitive early exit
-            conf, needs_retrieval, _ = self.metacog.assess(x, prev_x, iteration)
+            conf, needs_retrieval, _, difficulty = self.metacog.assess(x, prev_x, iteration)
             all_confidences.append(conf)
 
             if self.metacog.should_emit(conf, iteration):

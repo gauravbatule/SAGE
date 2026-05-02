@@ -1,5 +1,5 @@
 """
-Sage 4.0 — Hybrid Graph-Cortex Language Model Architecture
+Sage 5.0 — Hybrid Graph-Cortex Language Model Architecture
 
 A fundamentally new approach to language modeling that replaces attention
 with Wave Propagation (multi-scale causal convolutions) and Resonance Memory
@@ -24,10 +24,11 @@ Example:
     torch.Size([1, 128, 32000])
 """
 
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 __author__ = "Gaurav Batule"
 
 from .config import SageConfig, get_config
+from .generation import generate_tokens
 from .sage import SageModel
 
-__all__ = ["SageConfig", "SageModel", "get_config"]
+__all__ = ["SageConfig", "SageModel", "get_config", "generate_tokens"]

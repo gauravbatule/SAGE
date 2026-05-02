@@ -1,5 +1,5 @@
 """
-Reasoning Core v4.0 — Wave Propagation + Resonance Memory
+Reasoning Core v5.0 — Wave Propagation + Resonance Memory
 
 "Maybe Attention Is Not All You Need"
 
@@ -8,37 +8,22 @@ replaces attention with TWO complementary mechanisms:
 
   1. CAUSAL WAVE PROPAGATION (local understanding)
      Multi-scale causal convolutions that capture syntax, grammar,
-     and local phrase structure. Like how waves propagate through
-     a medium — information flows causally, each position integrates
-     signals from its local neighborhood.
+     and local phrase structure. Information flows causally through
+     the sequence with each position integrating signals from its
+     local neighborhood at multiple scales.
 
   2. RESONANCE MEMORY (global understanding)
-     A shared "neural whiteboard" with K memory slots. Each position
-     WRITES important information to the whiteboard and READS context
-     it needs. The whiteboard accumulates causally — position i's
-     memory contains a compressed summary of ALL positions 0..i.
-     This gives GLOBAL context access without O(n^2) attention.
+     A shared neural whiteboard with K memory slots. Each position
+     WRITES important information and READS relevant context via
+     cumulative accumulation with exponential decay. This gives
+     global context access in O(n·K·D) — linear in sequence length.
 
-WHY THIS IS NOT ATTENTION:
-  - Attention: O(n^2) pairwise dot products between ALL positions,
-    followed by softmax over sequence length, producing weighted
-    value combinations. Every token explicitly compares to every other.
-  - Resonance Memory: O(n*K*D) where K is memory slots (64-128).
-    Tokens write to and read from a SHARED COMPRESSED MEMORY.
-    No pairwise comparison. No softmax over sequence length.
-    More like a neural RAM than a lookup table.
-
-WHY THIS IS NOT MAMBA:
-  - Mamba: Selective State Space Model with input-dependent transitions.
-    Linear recurrence with selective scan. State evolves sequentially.
-  - Resonance: No recurrence. Uses cumulative sum (parallelizable on GPU).
-    No state space formulation. No selective scan operator.
-
-WHY THIS IS NOT RWKV/LINEAR ATTENTION:
-  - Linear attention approximates softmax(QK^T)V as Q(K^T V).
-    It's a mathematical reformulation of attention.
-  - Resonance uses explicit WRITE/READ operations with separate
-    projections. It's a memory system, not a factored attention.
+v5.0 additions:
+  - Exponential decay in resonance memory (configurable via config)
+  - Dropout after each sub-block
+  - Per-layer learnable scaling (layer-scale initialization)
+  - Gradient checkpointing support
+  - Configurable resonance slots and memory dimension
 """
 
 __all__ = [
@@ -51,9 +36,12 @@ __all__ = [
     "ReasoningCore",
 ]
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from .config import SageConfig
 
@@ -94,10 +82,10 @@ class CausalConv1d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, D = x.shape
-        x_t = x.transpose(1, 2)                    # (B, D, L)
-        x_t = F.pad(x_t, (self.pad, 0))            # causal pad left
-        x_t = self.dw_conv(x_t)                     # (B, D, L)
-        return self.pw_conv(x_t.transpose(1, 2))    # (B, L, D)
+        x_t = x.transpose(1, 2)
+        x_t = F.pad(x_t, (self.pad, 0))
+        x_t = self.dw_conv(x_t)
+        return self.pw_conv(x_t.transpose(1, 2))
 
 
 class WaveMixer(nn.Module):
@@ -129,56 +117,49 @@ class WaveMixer(nn.Module):
 
 class ResonanceMemory(nn.Module):
     """
-    A globally shared neural whiteboard.
+    A globally shared neural whiteboard with exponential decay.
 
     Mechanism:
-      1. Write: Positions project state into K slots with importance weights.
-      2. Accumulate: Memory is built causally via O(n) cumulative sum.
-      3. Read: Queries retrieve relevant context from accumulated state.
-      4. Gate: Controls mixture of retrieved context and current state.
-      3. READ: Each position generates a read query and retrieves
-         relevant information from its accumulated memory state.
-      4. GATE: A learned gate controls how much retrieved context
-         mixes with the current representation.
-
+      1. WRITE: Positions project state into K slots with importance weights.
+      2. ACCUMULATE: Memory is built causally via cumsum with exponential decay.
+         Older writes decay by factor decay^distance, preventing stale context.
+      3. READ: Each position generates a read query and retrieves relevant
+         information from its accumulated memory state.
+      4. GATE: A learned gate controls how much retrieved context mixes
+         with the current representation.
     """
-    def __init__(self, dim: int, n_slots: int = 16, mem_dim: int = 32):
+    def __init__(self, dim: int, n_slots: int = 32, mem_dim: int = 64, decay: float = 0.999):
         super().__init__()
         self.dim = dim
         self.n_slots = n_slots
         self.mem_dim = mem_dim
+        self.decay = decay
 
-        # Write: select slots + compress value to small dim
         self.write_key = nn.Linear(dim, n_slots, bias=False)
         self.write_value = nn.Linear(dim, mem_dim, bias=False)
 
-        # Read: select slots + decompress back to full dim
         self.read_key = nn.Linear(dim, n_slots, bias=False)
         self.read_expand = nn.Linear(mem_dim, dim, bias=False)
 
-        # Output gate
         self.gate = nn.Linear(dim * 2, dim, bias=False)
         self.mem_norm = RMSNorm(dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, L, D)
-        Returns: (B, L, D) — enriched with global context
-
-        Memory: (B, L, K, mem_dim) — with K=16, mem_dim=32, this is
-        only ~8MB per layer. Fully vectorized via cumsum.
-        """
         B, L, D = x.shape
 
-        wk = F.softmax(self.write_key(x), dim=-1)           # (B, L, K)
-        wv = self.write_value(x)                            # (B, L, mem_dim)
+        wk = F.softmax(self.write_key(x), dim=-1)
+        wv = self.write_value(x)
 
-        mem_updates = wk.unsqueeze(-1) * wv.unsqueeze(-2)   # (B, L, K, mem_dim)
+        mem_updates = wk.unsqueeze(-1) * wv.unsqueeze(-2)  # (B, L, K, mem_dim)
 
-        # Causal accumulation
-        mem_state = torch.cumsum(mem_updates, dim=1)        # (B, L, K, mem_dim)
+        if self.decay < 1.0:
+            steps = torch.arange(L, device=x.device, dtype=x.dtype)
+            decay_weights = (self.decay ** (L - 1 - steps)).view(1, L, 1, 1)
+            mem_updates = mem_updates * decay_weights
 
-        rk = F.softmax(self.read_key(x), dim=-1)            # (B, L, K)
+        mem_state = torch.cumsum(mem_updates, dim=1)
+
+        rk = F.softmax(self.read_key(x), dim=-1)
         retrieved_compressed = (rk.unsqueeze(-1) * mem_state).sum(dim=-2)
 
         retrieved = self.read_expand(retrieved_compressed)
@@ -192,52 +173,71 @@ class WaveBlock(nn.Module):
     """
     Sage reasoning stack block.
     Flow: input -> [WaveMixer] -> [ResonanceMemory] -> [SwiGLU] -> output
+
+    v5.0: dropout, layer-scale, gradient checkpointing support.
     """
     def __init__(self, config: SageConfig, layer_idx: int = 0):
         super().__init__()
+        self.config = config
         dim = config.core_dim
 
-        # Adaptive kernel sizes per layer (deeper = wider receptive field)
         depth_ratio = layer_idx / max(config.core_n_layers - 1, 1)
         short_k = 3
         mid_k = 5 + int(depth_ratio * 12)
         long_k = 11 + int(depth_ratio * 32)
-        mid_k = mid_k | 1   # ensure odd
+        mid_k = mid_k | 1
         long_k = long_k | 1
 
-        # 1. Local causality
         self.wave_norm = RMSNorm(dim)
         self.wave = WaveMixer(dim, short_k, mid_k, long_k)
 
-        # 2. Global context
-        n_slots = 16
-        mem_dim = 32
         self.resonance_norm = RMSNorm(dim)
-        self.resonance = ResonanceMemory(dim, n_slots=n_slots, mem_dim=mem_dim)
+        self.resonance = ResonanceMemory(
+            dim,
+            n_slots=config.resonance_slots,
+            mem_dim=config.resonance_mem_dim,
+            decay=config.resonance_decay,
+        )
 
-        # 3. Position-wise mapping
         self.mlp_norm = RMSNorm(dim)
         self.mlp = SwiGLU(dim, config.core_mlp_dim)
 
+        self.drop = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
+
+        self.wave_scale = nn.Parameter(torch.full((), config.layer_scale_init))
+        self.resonance_scale = nn.Parameter(torch.full((), config.layer_scale_init))
+        self.mlp_scale = nn.Parameter(torch.full((), config.layer_scale_init))
+
+    def _wave_fn(self, x: torch.Tensor) -> torch.Tensor:
+        return self.drop(self.wave(self.wave_norm(x))) * self.wave_scale
+
+    def _resonance_fn(self, x: torch.Tensor) -> torch.Tensor:
+        return self.drop(self.resonance(self.resonance_norm(x))) * self.resonance_scale
+
+    def _mlp_fn(self, x: torch.Tensor) -> torch.Tensor:
+        return self.drop(self.mlp(self.mlp_norm(x))) * self.mlp_scale
+
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-        x = x + self.wave(self.wave_norm(x))
-        x = x + self.resonance(self.resonance_norm(x))
-        x = x + self.mlp(self.mlp_norm(x))
+        if self.config.gradient_checkpointing and self.training:
+            x = x + grad_checkpoint(self._wave_fn, x, use_reentrant=False)
+            x = x + grad_checkpoint(self._resonance_fn, x, use_reentrant=False)
+            x = x + grad_checkpoint(self._mlp_fn, x, use_reentrant=False)
+        else:
+            x = x + self._wave_fn(x)
+            x = x + self._resonance_fn(x)
+            x = x + self._mlp_fn(x)
         return x
 
 
 class ReasoningCore(nn.Module):
     """
-    Sage 4.0 Reasoning Core: Wave Propagation + Resonance Memory
+    Sage 5.0 Reasoning Core: Wave Propagation + Resonance Memory
 
-    "Maybe Attention Is Not All You Need"
-
-    This replaces the Transformer's attention mechanism with:
+    Replaces the Transformer's attention mechanism with:
     1. Multi-scale causal convolutions (local patterns, O(n*k))
-    2. Resonance memory (global context, O(n*K*D))
+    2. Resonance memory with decay (global context, O(n*K*D))
 
     Combined: O(n * (k + K*D)) per layer — strictly linear in sequence length.
-    No attention. No recurrence. No state spaces.
     """
     def __init__(self, config: SageConfig):
         super().__init__()
