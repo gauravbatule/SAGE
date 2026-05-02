@@ -1,5 +1,5 @@
 """
-Sage 5.0 — Character-Level Training Pipeline
+Sage 6.0 — Character-Level Training Pipeline
 
 Downloads a small text corpus (Shakespeare), trains a character-level Sage model,
 and demonstrates that the architecture learns language patterns.
@@ -110,7 +110,7 @@ def cosine_lr_with_warmup(
 
 
 class Trainer:
-    """Training loop for Sage 5.0 with warmup, AMP, gradient accumulation, and resume."""
+    """Training loop for Sage 6.0 with warmup, AMP, gradient accumulation, and resume."""
 
     def __init__(
         self,
@@ -158,7 +158,7 @@ class Trainer:
         self.optimizer = torch.optim.AdamW([
             {"params": model.graph.parameters(), "lr": lr * 0.3},
             {"params": model.core.parameters(), "lr": lr},
-            {"params": model.binder.parameters(), "lr": lr},
+            {"params": model.phase.parameters(), "lr": lr},
             {"params": model.metacog.parameters(), "lr": lr},
             {"params": model.senses.parameters(), "lr": lr},
         ], weight_decay=0.1)
@@ -395,7 +395,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Train Sage 5.0 on Shakespeare (character-level). "
+            "Train Sage 6.0 on Shakespeare (character-level). "
             "Supports gradient accumulation, AMP, cosine-with-warmup LR, "
             "checkpoint resume, and optional W&B logging."
         )
@@ -421,7 +421,7 @@ def main() -> None:
 
     # ── Header ────────────────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("  SAGE 5.0 — Wave Propagation + Resonance Memory")
+    logger.info("  SAGE 6.0 — Harmonic Waves + Hebbian Resonance Memory")
     logger.info("  Character-Level Training Demo")
     logger.info("=" * 60)
 
@@ -462,17 +462,18 @@ def main() -> None:
         n_active_limit=256,
         text_vocab_size=tokenizer.vocab_size,
         core_dim=256,
-        core_n_heads=4,
         core_n_layers=4,
         core_mlp_ratio=2.667,
         context_length=args.seq_len * 4,
-        resonance_slots=16,
+        resonance_n_slots=4,
         resonance_mem_dim=32,
-        resonance_decay=0.999,
+        resonance_decay_init=0.95,
+        sparse_k_ratio=0.3,
         dropout=0.1,
         layer_scale_init=1e-4,
         max_think_iterations=2,
         min_think_iterations=1,
+        max_train_iterations=2,
         metacog_dim=64,
         init_std=0.02,
     )

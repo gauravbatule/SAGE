@@ -1,5 +1,5 @@
 """
-Sage 5.0 — Conversational Training with BPE Tokenizer
+Sage 6.0 — Conversational Training with BPE Tokenizer
 
 Trains the Sage model on the Stanford Alpaca instruction-following dataset
 using tiktoken BPE tokenization, mixed-precision training, cosine learning
@@ -185,7 +185,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Sage 5.0 — Conversational Training with BPE. "
+            "Sage 6.0 — Conversational Training with BPE. "
             "Trains on Stanford Alpaca with cosine-warmup LR, AMP, gradient "
             "accumulation, and checkpoint resume."
         )
@@ -213,7 +213,7 @@ def main() -> None:
     grad_accum_steps = max(1, args.grad_accum_steps)
 
     logger.info("=" * 60)
-    logger.info("  SAGE 5.0 — Wave Propagation + Resonance Memory")
+    logger.info("  SAGE 6.0 — Harmonic Waves + Hebbian Resonance Memory")
     logger.info("  BPE Tokenizer + Conversational Training")
     logger.info("=" * 60)
 
@@ -261,23 +261,24 @@ def main() -> None:
 
     # ── Model ─────────────────────────────────────────────────────────
     config = SageConfig(
-        name="sage-chat-v5",
+        name="sage-chat-v6",
         n_nodes=vocab_size,
         n_active_limit=args.max_len,
         text_vocab_size=vocab_size,
         core_dim=256,
-        core_n_heads=4,
         core_n_layers=6,
         core_mlp_ratio=2.667,
         context_length=args.max_len + 128,
         max_think_iterations=2,
         min_think_iterations=1,
+        max_train_iterations=2,
         metacog_dim=64,
         weight_tying=True,
         init_std=0.02,
-        resonance_slots=16,
+        resonance_n_slots=4,
         resonance_mem_dim=32,
-        resonance_decay=0.999,
+        resonance_decay_init=0.95,
+        sparse_k_ratio=0.3,
         dropout=0.1,
         layer_scale_init=1e-4,
     )

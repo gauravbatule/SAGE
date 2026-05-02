@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sage-architecture"
-version = "5.0.0"
-description = "Hybrid Graph-Cortex Language Model — Wave Propagation + Resonance Memory"
+version = "6.0.0"
+description = "Brain-Inspired Ultra-Efficient Language Architecture — Harmonic Waves + Hebbian Resonance Memory"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"

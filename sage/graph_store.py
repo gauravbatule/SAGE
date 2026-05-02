@@ -1,5 +1,5 @@
 """
-Sage 5.0 — Graph Substrate
+Sage 6.0 — Graph Substrate
 
 Lean knowledge store that maps token/concept IDs directly to core_dim
 vectors. At scale, this would be memory-mapped from NVMe with only

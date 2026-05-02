@@ -1,9 +1,10 @@
 """
-Test suite for Sage 5.0 architecture.
+Test suite for Sage 6.0 architecture.
 
 Covers: config validation, model instantiation, forward pass, weight tying,
-generation utilities, component-level checks, and v5.0 features (decay,
-dropout, layer-scale, gradient checkpointing, metacognitive improvements).
+generation utilities, component-level checks, and v6.0 features (harmonic waves,
+Hebbian memory, sparse MLP, predictive coding, phase encoding, cognitive routing,
+multi-iteration training, recurrent state).
 """
 
 import pytest
@@ -25,20 +26,25 @@ def small_config() -> SageConfig:
         n_active_limit=32,
         text_vocab_size=256,
         core_dim=64,
-        core_n_heads=4,
         core_n_layers=2,
         core_mlp_ratio=2.0,
         context_length=64,
         max_think_iterations=2,
         min_think_iterations=1,
+        max_train_iterations=2,
         metacog_dim=32,
         weight_tying=True,
         init_std=0.02,
-        resonance_slots=8,
+        resonance_n_slots=4,
         resonance_mem_dim=16,
-        resonance_decay=0.99,
+        resonance_decay_init=0.95,
+        sparse_k_ratio=0.3,
         dropout=0.0,
         layer_scale_init=1e-4,
+        phase_encoding=True,
+        predictive_coding=True,
+        cognitive_routing=True,
+        routing_capacity=0.5,
     )
 
 
@@ -65,23 +71,14 @@ class TestConfig:
         config = get_config("alpha")
         assert config.core_mlp_dim % 8 == 0
 
-    def test_head_dim(self):
-        config = SageConfig(core_dim=512, core_n_heads=8)
-        assert config.head_dim == 64
-
-    def test_validation_catches_bad_heads(self):
-        config = SageConfig(core_dim=100, core_n_heads=3)
-        with pytest.raises(AssertionError, match="divisible"):
-            config.validate()
-
     def test_validation_catches_bad_nodes(self):
         config = SageConfig(n_nodes=10, text_vocab_size=100)
         with pytest.raises(AssertionError, match="n_nodes"):
             config.validate()
 
     def test_validation_catches_bad_decay(self):
-        config = SageConfig(resonance_decay=1.5)
-        with pytest.raises(AssertionError, match="resonance_decay"):
+        config = SageConfig(resonance_decay_init=1.5)
+        with pytest.raises(AssertionError, match="resonance_decay_init"):
             config.validate()
 
     def test_validation_catches_bad_dropout(self):
@@ -89,15 +86,38 @@ class TestConfig:
         with pytest.raises(AssertionError, match="dropout"):
             config.validate()
 
+    def test_validation_catches_bad_sparse_ratio(self):
+        config = SageConfig(sparse_k_ratio=0.0)
+        with pytest.raises(AssertionError, match="sparse_k_ratio"):
+            config.validate()
+
+    def test_validation_catches_bad_routing_capacity(self):
+        config = SageConfig(routing_capacity=0.0)
+        with pytest.raises(AssertionError, match="routing_capacity"):
+            config.validate()
+
     def test_new_config_fields_exist(self):
         config = get_config("alpha")
-        assert hasattr(config, "resonance_slots")
+        assert hasattr(config, "resonance_n_slots")
         assert hasattr(config, "resonance_mem_dim")
-        assert hasattr(config, "resonance_decay")
+        assert hasattr(config, "resonance_decay_init")
+        assert hasattr(config, "sparse_k_ratio")
+        assert hasattr(config, "phase_encoding")
+        assert hasattr(config, "predictive_coding")
+        assert hasattr(config, "cognitive_routing")
+        assert hasattr(config, "routing_capacity")
+        assert hasattr(config, "max_train_iterations")
         assert hasattr(config, "dropout")
         assert hasattr(config, "gradient_checkpointing")
         assert hasattr(config, "layer_scale_init")
         assert hasattr(config, "context_length")
+
+    def test_removed_fields_absent(self):
+        config = get_config("alpha")
+        assert not hasattr(config, "core_n_heads")
+        assert not hasattr(config, "core_dropout")
+        assert not hasattr(config, "vision_patch_dim")
+        assert not hasattr(config, "audio_frame_dim")
 
 
 # --- Model Tests ---
@@ -139,12 +159,12 @@ class TestModel:
     def test_parameter_count(self, model: SageModel):
         counts = model.count_parameters()
         expected_keys = {
-            "graph_substrate", "sensory_cortex", "temporal_binding",
+            "graph_substrate", "sensory_cortex", "phase_encoding",
             "reasoning_core", "metacognitive", "total", "active_per_token",
         }
         assert set(counts.keys()) == expected_keys
         assert counts["total"] > 0
-        assert counts["temporal_binding"] == 0
+        assert counts["sensory_cortex"] == 0
 
     def test_metrics(self, model: SageModel, small_config: SageConfig):
         tokens = torch.randint(0, small_config.text_vocab_size, (1, 8))
@@ -167,6 +187,16 @@ class TestModel:
         m.train()
         output = m(tokens)
         assert output["logits"].shape[-1] == small_config.text_vocab_size
+
+    def test_multi_iteration_training(self, small_config: SageConfig):
+        small_config.max_train_iterations = 3
+        m = SageModel(small_config)
+        m.train()
+        tokens = torch.randint(0, small_config.text_vocab_size, (1, 8))
+        targets = torch.randint(0, small_config.text_vocab_size, (1, 8))
+        output = m(tokens, targets=targets)
+        assert output["loss"] is not None
+        output["loss"].backward()
 
 
 # --- Generation Utility Tests ---
@@ -248,59 +278,147 @@ class TestComponents:
             ids, _, _ = cortex.ground_text(tokens)
         assert ids[0, 0].item() == small_config.text_vocab_size - 1
 
-    def test_temporal_binding_passthrough(self, small_config: SageConfig):
-        from sage.temporal_binding import TemporalBinding
-        binder = TemporalBinding(small_config)
+    def test_phase_encoding(self, small_config: SageConfig):
+        from sage.phase_encoding import PhaseEncoding
+        phase = PhaseEncoding(small_config)
         x = torch.randn(2, 8, small_config.core_dim)
-        positions = torch.arange(8).unsqueeze(0).expand(2, -1)
-        out = binder.bind(x, positions)
-        assert torch.equal(out, x)
+        out = phase(x)
+        assert out.shape == x.shape
+        assert not torch.equal(out, x)
 
-    def test_reasoning_core(self, small_config: SageConfig):
-        from sage.reasoning_core import ReasoningCore
-        core = ReasoningCore(small_config)
+    def test_phase_encoding_different_positions(self, small_config: SageConfig):
+        from sage.phase_encoding import PhaseEncoding
+        phase = PhaseEncoding(small_config)
+        x = torch.ones(1, 16, small_config.core_dim)
+        out = phase(x)
+        assert not torch.allclose(out[:, 0], out[:, 1], atol=1e-5)
+
+    def test_harmonic_wave_mixer(self, small_config: SageConfig):
+        from sage.reasoning_core import HarmonicWaveMixer
+        wave = HarmonicWaveMixer(small_config.core_dim, gamma_k=3, beta_k=7, theta_k=15)
         x = torch.randn(2, 8, small_config.core_dim)
-        out = core(x)
+        out = wave(x)
         assert out.shape == x.shape
 
-    def test_resonance_memory_decay(self, small_config: SageConfig):
-        from sage.reasoning_core import ResonanceMemory
-        mem = ResonanceMemory(
+    def test_hebbian_resonance_memory(self, small_config: SageConfig):
+        from sage.reasoning_core import HebbianResonanceMemory
+        mem = HebbianResonanceMemory(
             dim=small_config.core_dim,
-            n_slots=small_config.resonance_slots,
+            n_slots=small_config.resonance_n_slots,
             mem_dim=small_config.resonance_mem_dim,
-            decay=0.9,
+            decay_init=0.9,
         )
         x = torch.randn(1, 16, small_config.core_dim)
-        out = mem(x)
+        out, state = mem(x)
+        assert out.shape == x.shape
+        K, M = small_config.resonance_n_slots, small_config.resonance_mem_dim
+        assert state.shape == (1, K, M, M)
+
+    def test_hebbian_memory_with_state(self, small_config: SageConfig):
+        from sage.reasoning_core import HebbianResonanceMemory
+        mem = HebbianResonanceMemory(
+            dim=small_config.core_dim,
+            n_slots=small_config.resonance_n_slots,
+            mem_dim=small_config.resonance_mem_dim,
+        )
+        x1 = torch.randn(1, 8, small_config.core_dim)
+        x2 = torch.randn(1, 8, small_config.core_dim)
+        _, state = mem(x1)
+        out, state2 = mem(x2, state=state)
+        assert out.shape == x2.shape
+        assert not torch.equal(state, state2)
+
+    def test_sparse_cortical_mlp(self, small_config: SageConfig):
+        from sage.reasoning_core import SparseCorticalMLP
+        mlp = SparseCorticalMLP(
+            small_config.core_dim, small_config.core_mlp_dim,
+            k_ratio=small_config.sparse_k_ratio,
+        )
+        x = torch.randn(2, 8, small_config.core_dim)
+        out = mlp(x)
         assert out.shape == x.shape
 
-    def test_wave_block_layer_scale(self, small_config: SageConfig):
-        from sage.reasoning_core import WaveBlock
-        block = WaveBlock(small_config, layer_idx=0)
+    def test_cortical_block(self, small_config: SageConfig):
+        from sage.reasoning_core import CorticalBlock
+        block = CorticalBlock(small_config, layer_idx=0)
+        x = torch.randn(1, 8, small_config.core_dim)
+        out, state, prediction = block(x)
+        assert out.shape == x.shape
+        assert state is not None
+
+    def test_cortical_block_layer_scale(self, small_config: SageConfig):
+        from sage.reasoning_core import CorticalBlock
+        block = CorticalBlock(small_config, layer_idx=0)
         assert hasattr(block, "wave_scale")
         assert hasattr(block, "resonance_scale")
         assert hasattr(block, "mlp_scale")
         assert block.wave_scale.item() == pytest.approx(small_config.layer_scale_init, abs=1e-8)
+
+    def test_predictive_coding(self, small_config: SageConfig):
+        from sage.reasoning_core import CorticalBlock
+        block = CorticalBlock(small_config, layer_idx=0)
+        assert block.predictor is not None
+        assert block.prediction_gate is not None
+        x = torch.randn(1, 8, small_config.core_dim)
+        _, _, prediction = block(x)
+        assert prediction is not None
+        assert prediction.shape == x.shape
+
+    def test_predictive_coding_last_layer_no_predictor(self, small_config: SageConfig):
+        from sage.reasoning_core import CorticalBlock
+        block = CorticalBlock(small_config, layer_idx=small_config.core_n_layers - 1)
+        assert block.predictor is None
+
+    def test_reasoning_core_returns_states(self, small_config: SageConfig):
+        from sage.reasoning_core import ReasoningCore
+        core = ReasoningCore(small_config)
+        x = torch.randn(1, 8, small_config.core_dim)
+        out, states = core(x)
+        assert out.shape == x.shape
+        assert len(states) == small_config.core_n_layers
 
     def test_metacognitive_assess(self, small_config: SageConfig):
         from sage.metacognitive import MetacognitiveController
         metacog = MetacognitiveController(small_config)
         current = torch.randn(2, 8, small_config.core_dim)
         previous = torch.randn(2, 8, small_config.core_dim)
-        confidence, needs_retrieval, query, difficulty = metacog.assess(current, previous, 0)
-        assert 0.0 <= confidence <= 1.0
-        assert isinstance(needs_retrieval, bool)
-        assert query.shape == (2, small_config.core_dim)
-        assert 0.0 <= difficulty <= 1.0
+        result = metacog.assess(current, previous, 0)
+        assert 0.0 <= result["confidence"] <= 1.0
+        assert isinstance(result["needs_retrieval"], bool)
+        assert result["retrieval_vector"].shape == (2, small_config.core_dim)
+        assert 0.0 <= result["estimated_difficulty"] <= 1.0
+        assert result["per_token_difficulty"].shape == (2, 8)
 
-    def test_metacognitive_difficulty(self, small_config: SageConfig):
+    def test_metacognitive_refinement_loss(self, small_config: SageConfig):
         from sage.metacognitive import MetacognitiveController
         metacog = MetacognitiveController(small_config)
-        current = torch.randn(1, 4, small_config.core_dim)
-        previous = torch.zeros_like(current)
-        _, _, _, difficulty = metacog.assess(current, previous, 0)
-        assert isinstance(difficulty, float)
+        logits_prev = torch.randn(1, 8, small_config.text_vocab_size)
+        logits_curr = torch.randn(1, 8, small_config.text_vocab_size)
+        targets = torch.randint(0, small_config.text_vocab_size, (1, 8))
+        loss = metacog.refinement_loss(logits_prev, logits_curr, targets)
+        assert loss.ndim == 0
+        assert loss.item() >= 0.0
+
+    def test_cognitive_routing_disabled(self, small_config: SageConfig):
+        small_config.cognitive_routing = False
+        m = SageModel(small_config)
+        tokens = torch.randint(0, small_config.text_vocab_size, (1, 8))
+        output = m(tokens)
+        assert output["logits"].shape[-1] == small_config.text_vocab_size
+
+    def test_predictive_coding_disabled(self, small_config: SageConfig):
+        small_config.predictive_coding = False
+        m = SageModel(small_config)
+        tokens = torch.randint(0, small_config.text_vocab_size, (1, 8))
+        output = m(tokens)
+        assert output["logits"].shape[-1] == small_config.text_vocab_size
+
+    def test_phase_encoding_disabled(self, small_config: SageConfig):
+        small_config.phase_encoding = False
+        m = SageModel(small_config)
+        tokens = torch.randint(0, small_config.text_vocab_size, (1, 8))
+        output = m(tokens)
+        assert output["logits"].shape[-1] == small_config.text_vocab_size
 
 
 # --- Version Test ---
@@ -309,7 +427,7 @@ class TestComponents:
 class TestVersion:
     def test_version(self):
         import sage
-        assert sage.__version__ == "5.0.0"
+        assert sage.__version__ == "6.0.0"
 
     def test_exports(self):
         from sage import SageModel, SageConfig, get_config, generate_tokens

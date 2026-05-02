@@ -1,5 +1,5 @@
 """
-Sage 5.0 — Chat Server
+Sage 6.0 — Chat Server
 
 Serves the trained Sage model via HTTP with SSE streaming, multi-turn
 conversation, and a web chat UI.
@@ -253,8 +253,8 @@ class SageServer:
             "active_limit": self.config.n_active_limit,
             "max_think": self.config.max_think_iterations,
             "is_chat": True,
-            "version": "5.0",
-            "architecture": "Wave Propagation + Resonance Memory",
+            "version": "6.0",
+            "architecture": "Harmonic Waves + Hebbian Resonance Memory",
         }
 
 
@@ -421,7 +421,7 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    parser = argparse.ArgumentParser(description="Sage 5.0 Chat Server")
+    parser = argparse.ArgumentParser(description="Sage 6.0 Chat Server")
     parser.add_argument("--port", type=int, default=8888, help="Server port")
     parser.add_argument("--model", type=str, default="sage_chat_model.pt", help="Checkpoint path")
     parser.add_argument("--max-tokens", type=int, default=500, help="Max generation tokens cap")

@@ -1,13 +1,18 @@
 """
-Sage 5.0 — Metacognitive Controller
+Sage 6.0 — Metacognitive Controller
 
-Self-monitoring module that provides adaptive thinking depth. Easy tokens
-get a single reasoning pass; complex tokens iterate up to ``max_think_iterations``
-passes through the reasoning core. Includes confidence estimation, stagnation
-detection, difficulty prediction, and retrieval query generation.
+Brain-inspired self-monitoring module implementing adaptive cognitive resource
+allocation. Modeled after the prefrontal cortex's executive function:
 
-v5.0: Iteration embeddings are now actually used via learned projection.
-Added difficulty estimator for predicting needed iterations.
+  - Easy tokens get fast "reflexive" processing (1 pass, minimal compute)
+  - Hard tokens get slow "deliberative" processing (multiple passes, full resonance)
+  - The controller introspects on confidence, stagnation, and difficulty
+
+v6.0 changes:
+  - Per-token difficulty estimation (not just global mean)
+  - Cognitive load routing signal for per-token layer skipping
+  - Multi-iteration training support with refinement loss
+  - Functional retrieval: when stagnating, generates a query for graph re-retrieval
 """
 
 __all__ = ["MetacognitiveController"]
@@ -15,7 +20,7 @@ __all__ = ["MetacognitiveController"]
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Dict, Tuple
 
 from .config import SageConfig
 
@@ -54,22 +59,21 @@ class MetacognitiveController(nn.Module):
 
         self.retrieval_query = nn.Linear(config.core_dim, config.core_dim, bias=False)
 
-        self._state_history = []
-
     def assess(
         self,
         current_output: torch.Tensor,
         previous_output: torch.Tensor,
         iteration: int,
-    ) -> Tuple[float, bool, torch.Tensor, float]:
+    ) -> Dict[str, object]:
         """
-        Assess the current reasoning state.
+        Assess the current reasoning state per-token and globally.
 
-        Returns:
+        Returns dict with:
             confidence: Mean confidence score [0, 1].
+            per_token_difficulty: (B, L) difficulty scores for routing.
             needs_retrieval: Whether to trigger graph re-retrieval.
             retrieval_vector: Query vector for similarity search.
-            estimated_difficulty: Predicted difficulty [0, 1] (higher = harder).
+            estimated_difficulty: Global difficulty estimate [0, 1].
         """
         curr_summary = current_output.mean(dim=1)
         prev_summary = previous_output.mean(dim=1)
@@ -83,6 +87,8 @@ class MetacognitiveController(nn.Module):
 
         confidence = self.confidence_net(curr_summary_ctx).squeeze(-1)
 
+        per_token_difficulty = self.difficulty_head(current_output).squeeze(-1)
+
         stag_input = torch.cat([curr_summary, prev_summary], dim=-1)
         stagnation = self.stagnation_detector(stag_input).squeeze(-1)
 
@@ -92,9 +98,15 @@ class MetacognitiveController(nn.Module):
 
         retrieval_vector = self.retrieval_query(curr_summary)
 
-        estimated_difficulty = self.difficulty_head(curr_summary).squeeze(-1).mean().item()
+        estimated_difficulty = per_token_difficulty.mean().item()
 
-        return confidence.mean().item(), needs_retrieval, retrieval_vector, estimated_difficulty
+        return {
+            "confidence": confidence.mean().item(),
+            "per_token_difficulty": per_token_difficulty,
+            "needs_retrieval": needs_retrieval,
+            "retrieval_vector": retrieval_vector,
+            "estimated_difficulty": estimated_difficulty,
+        }
 
     def should_emit(self, confidence: float, iteration: int) -> bool:
         if iteration < self.config.min_think_iterations:
@@ -105,5 +117,30 @@ class MetacognitiveController(nn.Module):
             return True
         return False
 
+    def refinement_loss(
+        self,
+        logits_prev: torch.Tensor,
+        logits_curr: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Penalize iterations that produce WORSE predictions than the previous one.
+        Encourages the model to refine rather than diverge across iterations.
+        """
+        loss_prev = F.cross_entropy(
+            logits_prev.view(-1, logits_prev.size(-1)),
+            targets.view(-1),
+            ignore_index=-100,
+            reduction='mean',
+        )
+        loss_curr = F.cross_entropy(
+            logits_curr.view(-1, logits_curr.size(-1)),
+            targets.view(-1),
+            ignore_index=-100,
+            reduction='mean',
+        )
+        regression = F.relu(loss_curr - loss_prev)
+        return regression
+
     def reset(self):
-        self._state_history.clear()
+        pass

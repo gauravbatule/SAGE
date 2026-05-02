@@ -1,16 +1,17 @@
 """
-Sage 5.0 — Hybrid Graph-Cortex Language Model Architecture
+Sage 6.0 — Brain-Inspired Ultra-Efficient Language Architecture
 
-A fundamentally new approach to language modeling that replaces attention
-with Wave Propagation (multi-scale causal convolutions) and Resonance Memory
-(compressed cumulative context), achieving linear-time sequence processing.
+A fundamentally new approach to language modeling inspired by neuroscience,
+replacing attention with harmonic wave propagation, Hebbian resonance memory,
+and sparse cortical activation for linear-time sequence processing with
+constant-memory inference.
 
 Key components:
     - GraphSubstrate: Sparse knowledge storage (scalable to NVMe)
-    - SensoryCortex: Multimodal input grounding
-    - TemporalBinding: Positional pass-through (position is implicit in causal convolutions)
-    - ReasoningCore: Wave Propagation + Resonance Memory stack
-    - MetacognitiveController: Adaptive thinking depth per token
+    - SensoryCortex: Input grounding with OOV detection
+    - PhaseEncoding: Hippocampal theta phase position encoding
+    - ReasoningCore: Harmonic Waves + Hebbian Memory + Sparse Cortex
+    - MetacognitiveController: Adaptive cognitive load routing
     - SageModel: Full model orchestrator
 
 Example:
@@ -24,7 +25,7 @@ Example:
     torch.Size([1, 128, 32000])
 """
 
-__version__ = "5.0.0"
+__version__ = "6.0.0"
 __author__ = "Gaurav Batule"
 
 from .config import SageConfig, get_config

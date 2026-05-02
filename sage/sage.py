@@ -1,25 +1,30 @@
 """
-Sage 5.0 — Model Orchestrator
+Sage 6.0 — Model Orchestrator
 
-End-to-end model that wires together the Sage architecture:
+Brain-Inspired Ultra-Efficient Language Architecture.
 
-    Graph Embedding → Wave Propagation → Metacognitive Control → Output
+End-to-end model wiring:
+
+    Graph Embedding → Phase Encoding → Cortical Reasoning → Output
 
 **Not a Transformer**: No attention (QKV, softmax), no O(n²) computation.
-Position is implicit in causal convolutions — no positional encoding needed.
+**Not Mamba**: No state spaces, no selective scan.
+**Not RWKV**: No WKV operator, no channel mixing.
 
-**Not Mamba**: No state spaces, no recurrence, no selective scan.
-
-**Unique to Sage**:
-    - Graph-based knowledge substrate (scalable to billions on NVMe)
-    - Multi-scale causal wave propagation (conv-based sequence mixing)
-    - Resonance memory with exponential decay (compressed global context)
-    - Metacognitive iterative reasoning (adaptive depth per token)
-    - Weight tying (embedding == output head)
-    - Per-layer scaling and gradient checkpointing
+**Unique to Sage 6.0**:
+    - Harmonic wave propagation (gamma/beta/theta/alpha oscillation bands)
+    - Hebbian resonance memory (outer-product matrices, input-dependent decay)
+    - Sparse cortical activation (~20% neurons fire per token)
+    - Predictive coding between layers (only errors propagate)
+    - Phase-encoded position (multiplicative amplitude modulation)
+    - Cognitive load routing (per-token adaptive compute)
+    - Metacognitive multi-iteration reasoning with refinement loss
+    - Recurrent inference state for O(1) per-token generation
 """
 
 __all__ = ["SageModel"]
+
+import random
 
 import torch
 import torch.nn as nn
@@ -29,32 +34,29 @@ from typing import Dict, List, Optional
 from .config import SageConfig
 from .graph_store import GraphSubstrate
 from .sensory_cortex import SensoryCortex
-from .temporal_binding import TemporalBinding
+from .phase_encoding import PhaseEncoding
 from .reasoning_core import ReasoningCore
 from .metacognitive import MetacognitiveController
 
 
 class SageModel(nn.Module):
     """
-    Sage 5.0: Wave Propagation Language Model with Metacognitive Control.
+    Sage 6.0: Brain-Inspired Wave Propagation Language Model.
     """
 
     def __init__(self, config: SageConfig):
         super().__init__()
         self.config = config
 
-        # Components
         self.graph = GraphSubstrate(config)
         self.senses = SensoryCortex(config)
-        self.binder = TemporalBinding(config)
+        self.phase = PhaseEncoding(config)
         self.core = ReasoningCore(config)
         self.metacog = MetacognitiveController(config)
 
-        # Weight tying: embedding and lm_head share weights
         if config.weight_tying:
             self.core.lm_head.weight = self.graph.node_embeddings.weight
 
-        # Initialize
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -73,53 +75,64 @@ class SageModel(nn.Module):
         self,
         token_ids: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
-        vision_patches: Optional[torch.Tensor] = None,
-        audio_frames: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         B, L = token_ids.shape
-        device = token_ids.device
 
-        # STEP 1: Ground inputs → node IDs
         active_ids, energies, positions = self.senses.ground_text(token_ids)
 
-        # STEP 2: Graph embedding (direct to core_dim)
-        x = self.graph.node_embeddings(active_ids)  # (B, L, core_dim)
+        x = self.graph(active_ids)
 
-        # STEP 3: Wave Propagation Reasoning
-        # No causal mask needed — causality is built into the convolutions!
-        # Training: 1 iteration (efficient). Inference: adaptive via metacog.
+        if self.config.phase_encoding:
+            x = self.phase(x)
+
         prev_x = torch.zeros_like(x)
         total_iterations = 0
         all_confidences = []
+        refinement_loss = torch.tensor(0.0, device=x.device)
+        prev_logits = None
 
-        n_iters = self.config.min_think_iterations if self.training else self.config.max_think_iterations
+        if self.training:
+            n_iters = random.randint(
+                self.config.min_think_iterations,
+                self.config.max_train_iterations,
+            )
+        else:
+            n_iters = self.config.max_think_iterations
+
+        states = None
         for iteration in range(n_iters):
-            x = self.core(x)  # No mask needed — waves are inherently causal
+            x, states = self.core(x, states=states)
             total_iterations += 1
 
-            if self.training:
+            if self.training and targets is not None and iteration > 0:
+                curr_logits = self.core.lm_head(x)
+                if prev_logits is not None:
+                    refinement_loss = refinement_loss + self.metacog.refinement_loss(
+                        prev_logits, curr_logits, targets,
+                    )
+                prev_logits = curr_logits.detach()
+            elif self.training:
                 prev_x = x.detach()
                 continue
 
-            # Inference: metacognitive early exit
-            conf, needs_retrieval, _, difficulty = self.metacog.assess(x, prev_x, iteration)
-            all_confidences.append(conf)
+            if not self.training:
+                assessment = self.metacog.assess(x, prev_x, iteration)
+                all_confidences.append(assessment["confidence"])
 
-            if self.metacog.should_emit(conf, iteration):
-                break
-            prev_x = x.detach()
+                if self.metacog.should_emit(assessment["confidence"], iteration):
+                    break
+                prev_x = x.detach()
 
-        # STEP 4: Output logits
-        logits = self.core.lm_head(x)  # (B, L, vocab_size)
+        logits = self.core.lm_head(x)
 
-        # Loss
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
+            ce_loss = F.cross_entropy(
                 logits.view(-1, self.config.text_vocab_size),
                 targets.view(-1),
                 ignore_index=-100,
             )
+            loss = ce_loss + 0.1 * refinement_loss
 
         return {
             "logits": logits,
@@ -171,7 +184,7 @@ class SageModel(nn.Module):
     def count_parameters(self) -> Dict[str, int]:
         graph_p = sum(p.numel() for p in self.graph.parameters())
         sense_p = sum(p.numel() for p in self.senses.parameters())
-        bind_p = sum(p.numel() for p in self.binder.parameters())
+        phase_p = sum(p.numel() for p in self.phase.parameters())
         core_p = sum(p.numel() for p in self.core.parameters())
         meta_p = sum(p.numel() for p in self.metacog.parameters())
         total = sum(p.numel() for p in self.parameters())
@@ -179,9 +192,9 @@ class SageModel(nn.Module):
         return {
             "graph_substrate": graph_p,
             "sensory_cortex": sense_p,
-            "temporal_binding": bind_p,
+            "phase_encoding": phase_p,
             "reasoning_core": core_p,
             "metacognitive": meta_p,
             "total": total,
-            "active_per_token": core_p + bind_p + meta_p,
+            "active_per_token": core_p + phase_p + meta_p,
         }
