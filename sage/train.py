@@ -138,9 +138,9 @@ class Trainer:
         self.grad_clip = grad_clip
         self.grad_accum_steps = max(1, grad_accum_steps)
 
-        # Mixed precision — only on CUDA
-        self.use_amp = self.device == "cuda"
-        self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
+        # Mixed precision — DISABLED: Hebbian memory produces NaN gradients in float16
+        self.use_amp = False
+        self.scaler = None
 
         self.train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
@@ -482,9 +482,9 @@ def main() -> None:
         sparse_k_ratio=0.3,
         dropout=0.1,
         layer_scale_init=1.0,
-        max_think_iterations=2,
+        max_think_iterations=1,
         min_think_iterations=1,
-        max_train_iterations=2,
+        max_train_iterations=1,
         metacog_dim=64,
         init_std=0.02,
     )

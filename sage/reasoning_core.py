@@ -393,10 +393,35 @@ class HebbianResonanceMemory(nn.Module):
         self.mem_norm = RMSNorm(dim)
         self.norm_eps = 1e-3
 
+    def _scan_fp32(self, decays, updates, state, key_updates, decay_1d, L, B):
+        """Run the sequential scan in float32 to avoid AMP gradient NaN."""
+        K, M = self.n_slots, self.mem_dim
+        mem_list = []
+        s = state.float()
+        decays = decays.float()
+        updates = updates.float()
+        for t in range(L):
+            s = decays[:, t] * s + updates[:, t]
+            s = s.clamp(-8.0, 8.0)
+            mem_list.append(s)
+        mem_states = torch.stack(mem_list, dim=1)
+
+        key_updates = key_updates.float()
+        decay_1d = decay_1d.float()
+        norm_list = []
+        norm_s = torch.zeros(B, K, M, device=state.device, dtype=torch.float32)
+        for t in range(L):
+            norm_s = decay_1d[:, t] * norm_s + key_updates[:, t]
+            norm_list.append(norm_s)
+        norm_states = torch.stack(norm_list, dim=1)
+
+        return mem_states, s, norm_states
+
     def forward(self, x: torch.Tensor,
                 state: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         B, L, D = x.shape
         K, M = self.n_slots, self.mem_dim
+        orig_dtype = x.dtype
 
         wk = self.write_key(x).view(B, L, K, M)
         wk = F.normalize(wk, dim=-1)
@@ -408,35 +433,23 @@ class HebbianResonanceMemory(nn.Module):
         updates = input_gate.unsqueeze(-1).unsqueeze(-1) * torch.einsum('blkm,blkn->blkmn', wk, wv)
 
         if state is None:
-            state = torch.zeros(B, K, M, M, device=x.device, dtype=x.dtype)
+            state = torch.zeros(B, K, M, M, device=x.device, dtype=torch.float32)
 
         decays = decay.unsqueeze(-1).unsqueeze(-1)
-
-        mem_list = []
-        s = state
-        for t in range(L):
-            s = decays[:, t] * s + updates[:, t]
-            s = s.clamp(-8.0, 8.0)
-            mem_list.append(s)
-        mem_states = torch.stack(mem_list, dim=1)
-        state = s
-
         key_updates = input_gate.unsqueeze(-1) * wk
         decay_1d = decay.unsqueeze(-1)
-        norm_list = []
-        norm_s = torch.zeros(B, K, M, device=x.device, dtype=x.dtype)
-        for t in range(L):
-            norm_s = decay_1d[:, t] * norm_s + key_updates[:, t]
-            norm_list.append(norm_s)
-        norm_states = torch.stack(norm_list, dim=1)
 
-        rq = self.read_query(x).view(B, L, K, M)
+        mem_states, state, norm_states = self._scan_fp32(
+            decays, updates, state, key_updates, decay_1d, L, B
+        )
+
+        rq = self.read_query(x).view(B, L, K, M).float()
         rq = F.normalize(rq, dim=-1)
 
         numerator = torch.einsum('blkmn,blkn->blkm', mem_states, rq)
         denominator = torch.einsum('blkm,blkm->blk', norm_states, rq).unsqueeze(-1).abs() + self.norm_eps
         retrieved = (numerator / denominator).reshape(B, L, K * M)
-        retrieved = retrieved.clamp(-10.0, 10.0)
+        retrieved = retrieved.clamp(-10.0, 10.0).to(orig_dtype)
 
         retrieved = self.read_expand(retrieved)
         retrieved = self.mem_norm(retrieved)
