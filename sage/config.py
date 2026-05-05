@@ -68,6 +68,13 @@ class SageConfig:
     # == Embedding ==
     normalize_embeddings: bool = False
 
+    # == Episodic Buffer ==
+    episodic_capacity: int = 512
+    episodic_enabled: bool = True
+
+    # == Concept Buffer ==
+    concept_buffer: int = 256
+
     @property
     def core_mlp_dim(self) -> int:
         raw = int(self.core_dim * self.core_mlp_ratio)

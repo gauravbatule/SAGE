@@ -25,7 +25,7 @@ Example:
     torch.Size([1, 128, 32000])
 """
 
-__version__ = "6.0.0"
+__version__ = "7.0.0"
 __author__ = "Gaurav Batule"
 
 from .config import SageConfig, get_config

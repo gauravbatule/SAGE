@@ -175,13 +175,16 @@ class Trainer:
         # Collect parameters, avoiding duplicates from weight tying
         seen = set()
         param_groups = []
-        for name, group_lr in [
+        named_groups = [
             ("graph", lr * 0.3),
             ("core", lr),
             ("phase", lr),
             ("metacog", lr),
             ("senses", lr),
-        ]:
+        ]
+        if hasattr(model, "episodic") and model.episodic is not None:
+            named_groups.append(("episodic", lr))
+        for name, group_lr in named_groups:
             params = []
             for p in getattr(model, name).parameters():
                 if id(p) not in seen:
@@ -189,6 +192,13 @@ class Trainer:
                     params.append(p)
             if params:
                 param_groups.append({"params": params, "lr": group_lr})
+
+        # Retrieval gate (scalar, not inside any submodule group)
+        if hasattr(model, "retrieval_gate"):
+            p = model.retrieval_gate
+            if id(p) not in seen:
+                seen.add(id(p))
+                param_groups.append({"params": [p], "lr": lr})
 
         # ── Fused AdamW ───────────────────────────────────────────────────────
         # torch.optim.AdamW supports fused=True on CUDA (PyTorch ≥ 2.0), which

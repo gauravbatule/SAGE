@@ -37,11 +37,15 @@ from .sensory_cortex import SensoryCortex
 from .phase_encoding import PhaseEncoding
 from .reasoning_core import ReasoningCore
 from .metacognitive import MetacognitiveController
+from .episodic_buffer import EpisodicBuffer
 
 
 class SageModel(nn.Module):
     """
-    Sage 6.0: Brain-Inspired Wave Propagation Language Model.
+    Sage 7.0: Brain-Inspired Wave Propagation Language Model.
+
+    No attention. No tokenizer. Character-level.
+    Context via Hebbian memory + episodic buffer + graph retrieval.
     """
 
     def __init__(self, config: SageConfig):
@@ -53,6 +57,15 @@ class SageModel(nn.Module):
         self.phase = PhaseEncoding(config)
         self.core = ReasoningCore(config)
         self.metacog = MetacognitiveController(config)
+
+        # Graph retrieval gate — starts near zero so retrieval has no effect until learned
+        self.retrieval_gate = nn.Parameter(torch.tensor(-3.0))
+
+        # Episodic buffer — hippocampal short-term memory
+        if config.episodic_enabled:
+            self.episodic = EpisodicBuffer(config.core_dim, capacity=config.episodic_capacity)
+        else:
+            self.episodic = None
 
         if config.weight_tying:
             self.core.lm_head.weight = self.graph.node_embeddings.weight
@@ -121,9 +134,24 @@ class SageModel(nn.Module):
                 assessment = self.metacog.assess(x, prev_x, iteration)
                 all_confidences.append(assessment["confidence"])
 
+                # Wire retrieval: when model detects stagnation, query graph
+                if assessment.get("needs_retrieval", False):
+                    rv = assessment["retrieval_vector"]
+                    scores, indices = self.graph.retrieve_by_similarity(rv, top_k=8)
+                    retrieved_embs = self.graph(indices)
+                    weights = F.softmax(scores.float(), dim=-1).unsqueeze(-1)
+                    context = (weights * retrieved_embs).sum(dim=1)
+                    gate = torch.sigmoid(self.retrieval_gate)
+                    x = x + gate * context.unsqueeze(1)
+
                 if self.metacog.should_emit(assessment["confidence"], iteration):
                     break
                 prev_x = x.detach()
+
+        # Episodic buffer: hippocampal short-term memory
+        episodic_state = None
+        if self.episodic is not None:
+            x, episodic_state = self.episodic(x)
 
         logits = self.core.lm_head(x)
 
@@ -142,6 +170,7 @@ class SageModel(nn.Module):
         return {
             "logits": logits,
             "loss": loss,
+            "core_states": states,
             "metrics": {
                 "iterations_used": total_iterations,
                 "confidences": all_confidences,
@@ -219,6 +248,11 @@ class SageModel(nn.Module):
         core_state = None if recurrent_state is None else recurrent_state.get("core_state")
         x, new_core_state = self.core.forward_step(x, core_state)   # (B, 1, D)
 
+        # --- 3.5. Episodic buffer step ---
+        ep_state = None if recurrent_state is None else recurrent_state.get("episodic")
+        if self.episodic is not None:
+            x, ep_state = self.episodic.forward_step(x, ep_state)
+
         # --- 4. Project to vocabulary ---
         logits = self.core.lm_head(x)        # (B, 1, vocab_size or n_nodes)
         if self.config.weight_tying and logits.shape[-1] > self.config.text_vocab_size:
@@ -228,8 +262,9 @@ class SageModel(nn.Module):
         # on every decode step (acts as a lightweight "KV-cache" state carrier).
         if recurrent_state is not None:
             recurrent_state["core_state"] = new_core_state
+            recurrent_state["episodic"] = ep_state
             return logits, recurrent_state
-        return logits, {"core_state": new_core_state}
+        return logits, {"core_state": new_core_state, "episodic": ep_state}
 
     @torch.inference_mode()
     def generate_fast(
@@ -286,27 +321,19 @@ class SageModel(nn.Module):
         first_logits = prefill_out["logits"][:, -1, :]    # (B, vocab_size)
         next_token = top_p_sample(first_logits, temperature, top_p)  # (B, 1)
 
-        # Seed the recurrent state. The prefill forward() ran through
-        # core.forward() which left Hebbian memories in their final-step
-        # matrices (the last element of each layer's state list). We expose
-        # those by re-running the last token through forward_step() so the
-        # conv buffers are also populated correctly. This is cheaper than
-        # re-running the full prompt and gives state that is consistent with
-        # the step-mode update equations.
-        #
-        # Practical note: for a clean numerical seed we replay just the last
-        # prompt token through forward_step() at position (L_prompt - 1).
-        # The Hebbian memory is re-initialised from zero at this point; the
-        # full context is already captured in the prefill logits / first token.
-        # A future enhancement can extract intermediate states from the prefill
-        # pass if the core exposes them.
-        recurrent_state = None
-        last_prompt_token = prompt_ids[:, -1:]             # (B, 1)
-        _, recurrent_state = self.forward_step(
-            last_prompt_token,
-            step_idx=L_prompt - 1,
-            recurrent_state=None,
-        )
+        # Seed recurrent state from prefill's Hebbian memory.
+        # The prefill built up rich Hebbian states across all prompt tokens.
+        # We carry those forward so the decode phase retains full prompt context.
+        # Conv buffers start empty (they fill within a few tokens given small kernels).
+        prefill_states = prefill_out.get("core_states", [None] * self.config.core_n_layers)
+        core_state = []
+        for hebb_matrix in prefill_states:
+            core_state.append({
+                "wave": None,
+                "resonance": hebb_matrix,
+                "norm": None,
+            })
+        recurrent_state = {"core_state": core_state}
 
         # --- Phase 2: Recurrent decode ---
         generated: List[int] = []

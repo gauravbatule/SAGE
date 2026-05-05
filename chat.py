@@ -181,11 +181,16 @@ def stream_response(model, config, tokenizer, tok_type, prompt, device,
             first_logits = first_logits[:, :config.text_vocab_size]
         next_token = top_p_sample(first_logits, temperature, top_p)
 
-        # --- Seed recurrent state from the last prompt token ---
-        last_prompt_token = input_ids[:, -1:]
-        _, recurrent_state = model.forward_step(
-            last_prompt_token, step_idx=L - 1, recurrent_state=None
-        )
+        # --- Seed recurrent state from prefill Hebbian memory ---
+        prefill_states = prefill_out.get("core_states", [None] * config.core_n_layers)
+        core_state = []
+        for hebb_matrix in prefill_states:
+            core_state.append({
+                "wave": None,
+                "resonance": hebb_matrix,
+                "norm": None,
+            })
+        recurrent_state = {"core_state": core_state}
 
         # --- Phase 2: Streaming decode ---
         step_idx = L
